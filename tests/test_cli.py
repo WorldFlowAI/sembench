@@ -1,6 +1,8 @@
 import json
 from pathlib import Path
 
+import pytest
+
 from sembench.cli import main
 
 
@@ -39,6 +41,7 @@ def test_cli_assert_result_gates_with_engine_summary(tmp_path: Path, capsys):
                     "quality_pass_rate": 1.0,
                     "semantic_placement_rate_by_request": 1.0,
                     "negative_control_backend_confirmed_rate": 0.0,
+                    "negative_control_semantic_placement_rate": 0.0,
                 }
             }
         ),
@@ -78,3 +81,30 @@ def test_cli_assert_result_gates_with_engine_summary(tmp_path: Path, capsys):
     )
 
     assert '"passed": true' in capsys.readouterr().out
+
+
+def test_cli_assert_result_gates_catches_negative_semantic_placement(tmp_path: Path):
+    result = tmp_path / "result.json"
+    result.write_text(
+        json.dumps(
+            {
+                "aggregate": {
+                    "quality_pass_rate": 1.0,
+                    "semantic_placement_rate_by_request": 1.0,
+                    "negative_control_semantic_placement_rate": 1.0,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(SystemExit):
+        main(
+            [
+                "assert-result-gates",
+                "--result",
+                str(result),
+                "--max-negative-control-semantic-placement-rate",
+                "0.0",
+            ]
+        )

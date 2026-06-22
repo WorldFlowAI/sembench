@@ -42,6 +42,9 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
     negative = [r for r in requests if r.negative_control]
     negative_blocks = sum(r.total_blocks for r in negative)
     negative_eligible = sum(r.semantic_eligible_blocks for r in negative)
+    negative_semantic_placements = sum(
+        1 for r in negative if r.route_outcome == "semantic_placement"
+    )
     negative_confirmed = (
         sum((r.backend_confirmed_blocks or 0) for r in negative) if has_confirmed else None
     )
@@ -85,6 +88,11 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
         "negative_control_blocks": negative_blocks,
         "negative_control_semantic_eligible_blocks": negative_eligible,
         "negative_control_semantic_eligible_rate": _rate(negative_eligible, negative_blocks),
+        "negative_control_semantic_placements": negative_semantic_placements,
+        "negative_control_semantic_placement_rate": _rate(
+            negative_semantic_placements,
+            len(negative),
+        ),
         "negative_control_backend_confirmed_blocks": negative_confirmed,
         "negative_control_backend_confirmed_rate": (
             _rate(negative_confirmed or 0, negative_blocks)

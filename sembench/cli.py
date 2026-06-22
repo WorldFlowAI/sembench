@@ -133,6 +133,7 @@ def build_parser() -> argparse.ArgumentParser:
     gates.add_argument("--min-materialized-tokens", type=int, default=0)
     gates.add_argument("--min-materialized-units", type=int, default=0)
     gates.add_argument("--max-negative-control-confirmed-rate", type=float, default=0.0)
+    gates.add_argument("--max-negative-control-semantic-placement-rate", type=float, default=1.0)
     gates.add_argument("--require-materialized-reuse", action="store_true")
     gates.add_argument("--require-no-engine-errors", action="store_true")
 
@@ -335,6 +336,15 @@ def cmd_assert_result_gates(args) -> None:
             float(negative_rate) <= args.max_negative_control_confirmed_rate,
             f"{negative_rate} > {args.max_negative_control_confirmed_rate}",
         )
+    negative_semantic_placement = aggregate.get("negative_control_semantic_placement_rate")
+    if negative_semantic_placement is not None:
+        require(
+            "negative_control_semantic_placement_rate",
+            float(negative_semantic_placement)
+            <= args.max_negative_control_semantic_placement_rate,
+            f"{negative_semantic_placement} > "
+            f"{args.max_negative_control_semantic_placement_rate}",
+        )
 
     materialization_events = sum(
         int(summary.get("materialization_events") or 0)
@@ -392,6 +402,7 @@ def cmd_assert_result_gates(args) -> None:
             "semantic_placement_rate_by_request": semantic_placement,
             "backend_confirmed_block_rate": backend_rate,
             "negative_control_backend_confirmed_rate": negative_rate,
+            "negative_control_semantic_placement_rate": negative_semantic_placement,
             "materialization_events": materialization_events,
             "materialized_tokens": materialized_tokens,
             "materialized_units": materialized_units,
