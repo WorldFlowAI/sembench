@@ -97,6 +97,40 @@ def test_parse_sglang_candidate_hit_is_not_materialization() -> None:
     assert summary.materialized_semantic_kv_reuse is False
 
 
+def test_parse_sglang_segmented_phases_are_backend_materialization() -> None:
+    logs = "\n".join(
+        [
+            "[FUZZY] register_donor_async: ok request_id=d1 tokens=3905 embed=394.1ms total=400.7ms",
+            "[FUZZY RADIX] Fuzzy match success: rid=r1 cached=3894, prompt=4024, offset=0, quality_cosine=0.964",
+            "[FUZZY RADIX] segmented phased paged prefill active: backend=phased_paged rid=r1 fresh_tokens=130 donor_tokens=3894 prompt_tokens=4024 phases=13 direct_paged_kv=True",
+            "[FUZZY RADIX] segmented prefill realized donor phase: backend=phased_paged rid=r1 donor_tokens=608 target=[21,629) prefix_len=629 direct_paged_kv=True",
+            "[FUZZY RADIX] segmented prefill realized donor phase: backend=phased_paged rid=r1 donor_tokens=656 target=[644,1300) prefix_len=1300 direct_paged_kv=True",
+            "[FUZZY] Realized 1264 fuzzy tokens (2 segments)",
+        ]
+    )
+
+    summary = parse_sglang_logs(logs)
+
+    assert summary.semantic_hits == 1
+    assert summary.materialization_events == 2
+    assert summary.materialized_tokens == 1264
+    assert summary.events["segmented_phases"][0]["target_start"] == "21"
+    assert summary.materialized_semantic_kv_reuse is True
+
+
+def test_parse_sglang_runtime_shape_warnings_are_not_silent() -> None:
+    logs = (
+        "2026-06-22 [E:onnxruntime:, sequential_executor.cc:572 ExecuteKernel] "
+        "Non-zero status code returned while running LayerNormalization node. "
+        "Shape mismatch attempting to re-use buffer. {1,256,384} != {5,256,384}."
+    )
+
+    summary = parse_sglang_logs(logs)
+
+    assert summary.errors == []
+    assert len(summary.runtime_warnings) == 1
+
+
 def test_parse_engine_events_dispatches_aliases() -> None:
     summary = parse_engine_events(
         "trt-llm",

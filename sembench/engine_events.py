@@ -57,6 +57,17 @@ SGLANG_REALIZED_RE = re.compile(
     r"\[FUZZY\]\s*Realized\s+(?P<tokens>\d+)\s+fuzzy tokens",
     re.IGNORECASE,
 )
+SGLANG_SEGMENTED_PHASE_RE = re.compile(
+    r"\[FUZZY RADIX\]\s*segmented prefill realized donor phase:.*?"
+    r"donor_tokens=(?P<tokens>\d+)\s+target=\[(?P<target_start>\d+),(?P<target_end>\d+)\).*?"
+    r"direct_paged_kv=(?P<direct_paged_kv>\S+)",
+    re.IGNORECASE,
+)
+RUNTIME_WARNING_MARKERS = (
+    "[E:onnxruntime:",
+    "Non-zero status code returned",
+    "Shape mismatch attempting to re-use buffer",
+)
 
 
 @dataclass(frozen=True)
@@ -74,6 +85,7 @@ class EngineReuseSummary:
     engine_boundaries: int = 0
     rejection_reasons: dict[str, int] = field(default_factory=dict)
     errors: list[str] = field(default_factory=list)
+    runtime_warnings: list[str] = field(default_factory=list)
     events: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
 
     @property
@@ -110,6 +122,7 @@ def parse_vllm_logs(logs: str) -> EngineReuseSummary:
         "materialized": [],
     }
     errors: list[str] = []
+    runtime_warnings: list[str] = []
     for line in logs.splitlines():
         for key, pattern in (
             ("donor_registered", VLLM_DONOR_RE),
@@ -123,6 +136,8 @@ def parse_vllm_logs(logs: str) -> EngineReuseSummary:
                 events[key].append(match.groupdict())
         if "ERROR" in line or "Traceback" in line:
             errors.append(line)
+        elif _is_runtime_warning(line):
+            runtime_warnings.append(line)
     return EngineReuseSummary(
         engine="vllm",
         donor_registrations=len(events["donor_registered"]),
@@ -131,6 +146,7 @@ def parse_vllm_logs(logs: str) -> EngineReuseSummary:
         materialization_events=len(events["materialized"]),
         materialized_tokens=sum(_int(event.get("tokens")) for event in events["materialized"]),
         errors=errors,
+        runtime_warnings=runtime_warnings,
         events=events,
     )
 
@@ -139,6 +155,7 @@ def parse_trtllm_audit_jsonl(text: str) -> EngineReuseSummary:
     events: dict[str, list[dict[str, Any]]] = {}
     rejection_reasons: dict[str, int] = {}
     errors: list[str] = []
+    runtime_warnings: list[str] = []
     for raw in text.splitlines():
         raw = raw.strip()
         if not raw:
@@ -146,7 +163,10 @@ def parse_trtllm_audit_jsonl(text: str) -> EngineReuseSummary:
         try:
             event = json.loads(raw)
         except json.JSONDecodeError:
-            errors.append(raw)
+            if _is_runtime_warning(raw):
+                runtime_warnings.append(raw)
+            else:
+                errors.append(raw)
             continue
         name = str(event.get("event") or "unknown")
         events.setdefault(name, []).append(event)
@@ -168,6 +188,7 @@ def parse_trtllm_audit_jsonl(text: str) -> EngineReuseSummary:
         engine_boundaries=len(boundaries),
         rejection_reasons=rejection_reasons,
         errors=errors,
+        runtime_warnings=runtime_warnings,
         events=events,
     )
 
@@ -177,8 +198,10 @@ def parse_sglang_logs(logs: str) -> EngineReuseSummary:
         "donor_registered": [],
         "semantic_hits": [],
         "materialized": [],
+        "segmented_phases": [],
     }
     errors: list[str] = []
+    runtime_warnings: list[str] = []
     for line in logs.splitlines():
         donor = SGLANG_DONOR_RE.search(line)
         if donor:
@@ -192,17 +215,28 @@ def parse_sglang_logs(logs: str) -> EngineReuseSummary:
         realized = SGLANG_REALIZED_RE.search(line)
         if realized:
             events["materialized"].append(realized.groupdict())
+        segmented_phase = SGLANG_SEGMENTED_PHASE_RE.search(line)
+        if segmented_phase:
+            events["segmented_phases"].append(segmented_phase.groupdict())
         if "ERROR" in line or "Traceback" in line:
             errors.append(line)
+        elif _is_runtime_warning(line):
+            runtime_warnings.append(line)
+    materialized = events["segmented_phases"] or events["materialized"]
     return EngineReuseSummary(
         engine="sglang",
         donor_registrations=len(events["donor_registered"]),
         semantic_hits=len(events["semantic_hits"]),
-        materialization_events=len(events["materialized"]),
-        materialized_tokens=sum(_int(event.get("tokens")) for event in events["materialized"]),
+        materialization_events=len(materialized),
+        materialized_tokens=sum(_int(event.get("tokens")) for event in materialized),
         errors=errors,
+        runtime_warnings=runtime_warnings,
         events=events,
     )
+
+
+def _is_runtime_warning(line: str) -> bool:
+    return any(marker in line for marker in RUNTIME_WARNING_MARKERS)
 
 
 def _int(value: Any) -> int:
