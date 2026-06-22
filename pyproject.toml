@@ -1,0 +1,35 @@
+[project]
+name = "sembench"
+version = "0.1.0"
+description = "SemBench: benchmark suite for semantic KV cache reuse"
+requires-python = ">=3.10"
+readme = "README.md"
+authors = [{ name = "WorldFlow AI" }]
+dependencies = []
+
+[project.optional-dependencies]
+longbench = ["datasets>=2.16"]
+tokenizer = ["transformers>=4.40"]
+live = ["aiohttp>=3.9"]
+dev = ["pytest>=8.0"]
+
+[project.scripts]
+sembench = "sembench.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["sembench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W"]
+ignore = ["E501"]
