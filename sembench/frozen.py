@@ -54,8 +54,9 @@ FROZEN_FIXTURE_V1 = FrozenSpec(
     tokenizer="Qwen/Qwen2.5-7B-Instruct",
 )
 
-# The real corpus (docs/DATASET.md). hf_revision intentionally unset until the
-# actual freeze moment: freezing against "main" would be a silent unpin.
+# The real corpus (docs/DATASET.md). hf_revision pinned at freeze time
+# (2026-07-27) to the exact THUDM/LongBench dataset commit; changing it is a
+# new corpus version, never an edit.
 FROZEN_V1 = FrozenSpec(
     name="v1",
     profile="longbench-v1",
@@ -64,7 +65,7 @@ FROZEN_V1 = FrozenSpec(
     max_items_per_dataset=15,
     max_segments=4,
     min_segment_chars=400,
-    hf_revision=None,  # set at freeze time to the exact THUDM/LongBench commit
+    hf_revision="5e628be450b7e67fb7ae6e201bd6d8f7056f7672",
     tokenizer="Qwen/Qwen2.5-7B-Instruct",
 )
 

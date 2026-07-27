@@ -35,6 +35,17 @@ from sembench.exact_cache import chunk_hash, iter_full_blocks
 from sembench.schema import WorkloadItem
 from sembench.tokenization import load_tokenizer
 
+# Blocks with fewer distinct tokens than this are degenerate — punctuation
+# runs ("=====", "----") that the fallback regex tokenizer explodes into one
+# token per character. They are not meaningful reuse content under any real
+# BPE tokenizer (which folds such runs into 1-2 tokens), so they are counted
+# separately rather than treated as phantom evidence.
+MIN_DISTINCT_TOKENS_PER_BLOCK = 4
+
+
+def is_degenerate_block(block: list[int]) -> bool:
+    return len(set(block)) < MIN_DISTINCT_TOKENS_PER_BLOCK
+
 
 @dataclass(frozen=True)
 class CollisionReport:
@@ -44,6 +55,7 @@ class CollisionReport:
     items_checked: int
     donor_blocks_indexed: int
     boilerplate_blocks: int
+    degenerate_blocks: int = 0
     violations: list[dict[str, Any]] = field(default_factory=list)
 
     @property
@@ -56,6 +68,7 @@ class CollisionReport:
             "items_checked": self.items_checked,
             "donor_blocks_indexed": self.donor_blocks_indexed,
             "boilerplate_blocks": self.boilerplate_blocks,
+            "degenerate_blocks": self.degenerate_blocks,
             "violations": list(self.violations),
             "passed": self.passed,
         }
@@ -77,12 +90,16 @@ def audit_manifest_items(
     donor_owners: dict[str, set[tuple[str, str]]] = {}
     own_donor_hashes: dict[str, set[str]] = {}
     donor_blocks = 0
+    degenerate = 0
     for item in items:
         own = own_donor_hashes.setdefault(item.item_id, set())
         for donor in item.donor_prompts:
             origin = str(donor.metadata.get("negative_source_id") or item.source_id)
             for block in iter_full_blocks(tokenizer.encode(donor.text), block_size):
                 donor_blocks += 1
+                if is_degenerate_block(block):
+                    degenerate += 1
+                    continue
                 digest = chunk_hash(block)
                 donor_owners.setdefault(digest, set()).add((item.item_id, origin))
                 own.add(digest)
@@ -118,6 +135,8 @@ def audit_manifest_items(
         recipient_tokens = tokenizer.encode(item.recipient_prompt)
         own = own_donor_hashes.get(item.item_id, set())
         for block_idx, block in enumerate(iter_full_blocks(recipient_tokens, block_size)):
+            if is_degenerate_block(block):
+                continue
             digest = chunk_hash(block)
             owners = donor_owners.get(digest)
             if not owners or digest in boilerplate:
@@ -136,5 +155,6 @@ def audit_manifest_items(
         items_checked=len(items),
         donor_blocks_indexed=donor_blocks,
         boilerplate_blocks=len(boilerplate),
+        degenerate_blocks=degenerate,
         violations=violations,
     )

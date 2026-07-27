@@ -226,12 +226,24 @@ def _build_items(
 ):
     if profile == "longbench-v1" and not datasets:
         datasets = list(DEFAULT_LONGBENCH_V1_DATASETS)
+    real_data = profile.startswith("longbench")
+    fetch_cap = max_items_per_dataset
+    if real_data and fetch_cap is not None:
+        # Over-fetch so dropping duplicated documents doesn't shrink the corpus.
+        fetch_cap = fetch_cap * 2
     records = load_source_records(
         profile=profile,
         datasets=datasets,
-        max_items_per_dataset=max_items_per_dataset,
+        max_items_per_dataset=fetch_cap,
         revision=revision,
     )
+    if real_data:
+        from sembench.dedupe import drop_overlapping_sources, trim_per_dataset
+
+        records, dedupe_report = drop_overlapping_sources(records)
+        records = trim_per_dataset(records, max_items_per_dataset)
+        if dedupe_report.dropped:
+            print(json.dumps({"dedupe_dropped": dedupe_report.dropped}, indent=2, sort_keys=True))
     config = TransformConfig(
         transforms=transforms,
         max_segments=max_segments,
