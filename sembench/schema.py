@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import platform
+import subprocess
+import time
+import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
 MANIFEST_VERSION = "sembench.manifest.v1"
-RESULT_VERSION = "sembench.result.v1"
+RESULT_VERSION = "sembench.result.v2"
 
 
 @dataclass(frozen=True)
@@ -110,6 +115,100 @@ class RequestMetrics:
 
     def to_dict(self) -> dict[str, Any]:
         return asdict(self)
+
+
+@dataclass(frozen=True)
+class RunMetadata:
+    """Reproducibility identity for one benchmark run.
+
+    Every result JSON must be traceable to: which manifest (by checksum),
+    which engine/backend, which arm of a paired cold/warm comparison, and
+    which sembench code produced it.
+    """
+
+    run_id: str
+    engine: str
+    manifest_path: str
+    manifest_sha256: str
+    arm: str = "single"
+    engine_version: str = ""
+    backend_id: str = ""
+    baseline_id: str = ""
+    sembench_version: str = ""
+    sembench_git_sha: str = ""
+    sembench_git_dirty: bool = False
+    semblend_version: str = ""
+    timestamp_utc: str = ""
+    python_version: str = field(default_factory=platform.python_version)
+    run_host: str = field(default_factory=platform.node)
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+def manifest_sha256(path: str | Path) -> str:
+    """SHA256 of the manifest file bytes (manifests are canonical JSONL)."""
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _package_version(name: str) -> str:
+    try:
+        from importlib.metadata import version
+
+        return version(name)
+    except Exception:
+        return ""
+
+
+def _git_state(repo_path: Path) -> tuple[str, bool]:
+    def run(args: list[str]) -> str:
+        try:
+            result = subprocess.run(
+                ["git", *args],
+                capture_output=True,
+                text=True,
+                timeout=5,
+                cwd=str(repo_path),
+            )
+            return result.stdout.strip() if result.returncode == 0 else ""
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return ""
+
+    sha = run(["rev-parse", "--short=12", "HEAD"])
+    dirty = bool(run(["status", "--porcelain"]))
+    return sha, dirty
+
+
+def collect_run_metadata(
+    *,
+    engine: str,
+    manifest: str | Path,
+    run_id: str | None = None,
+    arm: str = "single",
+    engine_version: str = "",
+    backend_id: str = "",
+    baseline_id: str = "",
+) -> RunMetadata:
+    sha, dirty = _git_state(Path(__file__).resolve().parents[1])
+    return RunMetadata(
+        run_id=run_id or uuid.uuid4().hex[:12],
+        engine=engine,
+        manifest_path=str(manifest),
+        manifest_sha256=manifest_sha256(manifest),
+        arm=arm,
+        engine_version=engine_version,
+        backend_id=backend_id,
+        baseline_id=baseline_id,
+        sembench_version=_package_version("sembench"),
+        sembench_git_sha=sha,
+        sembench_git_dirty=dirty,
+        semblend_version=_package_version("semblend"),
+        timestamp_utc=time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+    )
 
 
 def write_jsonl(path: str | Path, items: list[WorkloadItem]) -> None:

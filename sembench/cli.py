@@ -22,6 +22,8 @@ def main(argv: list[str] | None = None) -> None:
     args = parser.parse_args(argv)
     if args.command == "build":
         cmd_build(args)
+    elif args.command == "checksum-manifest":
+        cmd_checksum_manifest(args)
     elif args.command == "run-offline":
         cmd_run_offline(args)
     elif args.command == "run-live-sglang":
@@ -37,6 +39,26 @@ def main(argv: list[str] | None = None) -> None:
     else:
         parser.print_help()
         raise SystemExit(2)
+
+
+def _add_run_identity_args(parser: argparse.ArgumentParser) -> None:
+    """Run-identity flags shared by every runner (result schema v2)."""
+    parser.add_argument("--run-id", default=None, help="Stable id for this run (default: random)")
+    parser.add_argument(
+        "--arm",
+        choices=("cold", "warm", "single"),
+        default="single",
+        help="Which arm of a paired cold/warm comparison this run is",
+    )
+    parser.add_argument(
+        "--backend-id", default="", help="Cache backend under test, e.g. sglang-fuzzy-pr31057"
+    )
+    parser.add_argument(
+        "--baseline-id", default="", help="Baseline label when this run is a baseline arm"
+    )
+    parser.add_argument(
+        "--engine-version", default="", help="Engine version string (client cannot always detect)"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -57,7 +79,11 @@ def build_parser() -> argparse.ArgumentParser:
     build.add_argument("--max-segments", type=int, default=4)
     build.add_argument("--min-segment-chars", type=int, default=400)
 
+    checksum = sub.add_parser("checksum-manifest", help="Print the SHA256 of a manifest file")
+    checksum.add_argument("--manifest", required=True)
+
     offline = sub.add_parser("run-offline", help="Run offline exact-vs-SemBlend metrics")
+    _add_run_identity_args(offline)
     offline.add_argument("--manifest", required=True)
     offline.add_argument("--output", required=True)
     offline.add_argument("--block-size", type=int, default=16)
@@ -70,6 +96,7 @@ def build_parser() -> argparse.ArgumentParser:
     offline.add_argument("--max-items", type=int, default=None)
 
     live = sub.add_parser("run-live-sglang", help="Replay a manifest against SGLang")
+    _add_run_identity_args(live)
     live.add_argument("--manifest", required=True)
     live.add_argument("--output", required=True)
     live.add_argument("--base-url", required=True)
@@ -87,6 +114,7 @@ def build_parser() -> argparse.ArgumentParser:
     gateway = sub.add_parser(
         "run-live-gateway", help="Replay a manifest through an OpenAI-compatible gateway"
     )
+    _add_run_identity_args(gateway)
     gateway.add_argument("--manifest", required=True)
     gateway.add_argument("--output", required=True)
     gateway.add_argument("--gateway-url", required=True)
@@ -193,8 +221,35 @@ def cmd_run_offline(args) -> None:
             "mode": "offline",
             **config.__dict__,
         },
+        run=_run_metadata(args, engine="offline"),
     )
     print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
+
+
+def _run_metadata(args, *, engine: str):
+    from sembench.schema import collect_run_metadata
+
+    return collect_run_metadata(
+        engine=engine,
+        manifest=args.manifest,
+        run_id=args.run_id,
+        arm=args.arm,
+        engine_version=args.engine_version,
+        backend_id=args.backend_id,
+        baseline_id=args.baseline_id,
+    )
+
+
+def cmd_checksum_manifest(args) -> None:
+    from sembench.schema import manifest_sha256
+
+    print(
+        json.dumps(
+            {"manifest": args.manifest, "sha256": manifest_sha256(args.manifest)},
+            indent=2,
+            sort_keys=True,
+        )
+    )
 
 
 def cmd_run_live_sglang(args) -> None:
@@ -221,6 +276,7 @@ def cmd_run_live_sglang(args) -> None:
             "mode": "live-sglang",
             **config.__dict__,
         },
+        run=_run_metadata(args, engine="sglang"),
     )
     print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
 
@@ -250,6 +306,7 @@ def cmd_run_live_gateway(args) -> None:
             "mode": "live-gateway",
             **config.__dict__,
         },
+        run=_run_metadata(args, engine="gateway"),
     )
     print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
 

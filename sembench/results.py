@@ -8,7 +8,7 @@ import time
 from pathlib import Path
 from typing import Any
 
-from sembench.schema import RESULT_VERSION, RequestMetrics
+from sembench.schema import RESULT_VERSION, RequestMetrics, RunMetadata
 
 
 def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
@@ -128,12 +128,14 @@ def write_result(
     *,
     requests: list[RequestMetrics],
     config: dict[str, Any],
+    run: RunMetadata | None = None,
 ) -> None:
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "result_version": RESULT_VERSION,
         "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        "run": run.to_dict() if run is not None else None,
         "config": config,
         "environment": {
             "python": platform.python_version(),
