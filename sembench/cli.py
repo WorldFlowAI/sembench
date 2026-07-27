@@ -24,6 +24,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_build(args)
     elif args.command == "checksum-manifest":
         cmd_checksum_manifest(args)
+    elif args.command == "verify-endpoint":
+        cmd_verify_endpoint(args)
     elif args.command == "run-offline":
         cmd_run_offline(args)
     elif args.command == "run-live-sglang":
@@ -59,6 +61,11 @@ def _add_run_identity_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--engine-version", default="", help="Engine version string (client cannot always detect)"
     )
+    parser.add_argument(
+        "--skip-verify",
+        action="store_true",
+        help="Skip the endpoint pre-flight check (unverified runs are not leaderboard-eligible)",
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -81,6 +88,13 @@ def build_parser() -> argparse.ArgumentParser:
 
     checksum = sub.add_parser("checksum-manifest", help="Print the SHA256 of a manifest file")
     checksum.add_argument("--manifest", required=True)
+
+    verify = sub.add_parser(
+        "verify-endpoint", help="Pre-flight check a live endpoint (reachability, model identity)"
+    )
+    verify.add_argument("--engine", choices=("sglang", "gateway"), required=True)
+    verify.add_argument("--base-url", required=True)
+    verify.add_argument("--expect-model", default=None)
 
     offline = sub.add_parser("run-offline", help="Run offline exact-vs-SemBlend metrics")
     _add_run_identity_args(offline)
@@ -226,7 +240,7 @@ def cmd_run_offline(args) -> None:
     print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
 
 
-def _run_metadata(args, *, engine: str):
+def _run_metadata(args, *, engine: str, engine_version: str = ""):
     from sembench.schema import collect_run_metadata
 
     return collect_run_metadata(
@@ -234,10 +248,40 @@ def _run_metadata(args, *, engine: str):
         manifest=args.manifest,
         run_id=args.run_id,
         arm=args.arm,
-        engine_version=args.engine_version,
+        engine_version=args.engine_version or engine_version,
         backend_id=args.backend_id,
         baseline_id=args.baseline_id,
     )
+
+
+def _preflight(args, *, engine: str, base_url: str) -> str:
+    """Verify the endpoint before live traffic; returns detected engine version.
+
+    Fails the run (exit 3) on unreachable endpoint or model mismatch unless
+    --skip-verify is set.
+    """
+    if args.skip_verify:
+        return ""
+    from sembench.verify import verify_endpoint
+
+    report = verify_endpoint(engine=engine, base_url=base_url, expect_model=args.model)
+    print(json.dumps({"preflight": report.to_dict()}, indent=2, sort_keys=True))
+    if not report.passed:
+        raise SystemExit(3)
+    return report.engine_version
+
+
+def cmd_verify_endpoint(args) -> None:
+    from sembench.verify import verify_endpoint
+
+    report = verify_endpoint(
+        engine=args.engine,
+        base_url=args.base_url,
+        expect_model=args.expect_model,
+    )
+    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    if not report.passed:
+        raise SystemExit(3)
 
 
 def cmd_checksum_manifest(args) -> None:
@@ -253,6 +297,7 @@ def cmd_checksum_manifest(args) -> None:
 
 
 def cmd_run_live_sglang(args) -> None:
+    detected_version = _preflight(args, engine="sglang", base_url=args.base_url)
     config = LiveSglangConfig(
         manifest=args.manifest,
         output=args.output,
@@ -276,12 +321,13 @@ def cmd_run_live_sglang(args) -> None:
             "mode": "live-sglang",
             **config.__dict__,
         },
-        run=_run_metadata(args, engine="sglang"),
+        run=_run_metadata(args, engine="sglang", engine_version=detected_version),
     )
     print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
 
 
 def cmd_run_live_gateway(args) -> None:
+    detected_version = _preflight(args, engine="gateway", base_url=args.gateway_url)
     config = LiveGatewayConfig(
         manifest=args.manifest,
         output=args.output,
@@ -306,7 +352,7 @@ def cmd_run_live_gateway(args) -> None:
             "mode": "live-gateway",
             **config.__dict__,
         },
-        run=_run_metadata(args, engine="gateway"),
+        run=_run_metadata(args, engine="gateway", engine_version=detected_version),
     )
     print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
 
