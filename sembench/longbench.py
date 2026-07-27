@@ -29,6 +29,7 @@ def load_source_records(
     profile: str,
     datasets: list[str] | None = None,
     max_items_per_dataset: int | None = None,
+    revision: str | None = None,
 ) -> list[SourceRecord]:
     """Load normalized source records for a profile."""
     if profile == "fixture":
@@ -37,6 +38,7 @@ def load_source_records(
         return load_longbench_v1(
             datasets=datasets or list(DEFAULT_LONGBENCH_V1_DATASETS),
             max_items_per_dataset=max_items_per_dataset,
+            revision=revision,
         )
     if profile == "longbench-v2":
         return load_longbench_v2(max_items=max_items_per_dataset)
@@ -46,6 +48,7 @@ def load_source_records(
 def load_longbench_v1(
     datasets: list[str],
     max_items_per_dataset: int | None = None,
+    revision: str | None = None,
 ) -> list[SourceRecord]:
     """Load LongBench v1 tasks from Hugging Face datasets."""
     load_dataset = _datasets_loader()
@@ -54,6 +57,7 @@ def load_longbench_v1(
         ds = _load_longbench_v1_rows(
             load_dataset,
             dataset_name=dataset_name,
+            revision=revision,
         )
         for idx, row in enumerate(_take(ds, max_items_per_dataset)):
             context = str(row.get("context", ""))
@@ -129,22 +133,26 @@ def _load_with_fallbacks(
     candidates: tuple[str, ...],
     name: str | None,
     split: str,
+    revision: str | None = None,
 ):
     errors: list[str] = []
+    kwargs = {"split": split}
+    if revision is not None:
+        kwargs["revision"] = revision
     for dataset_path in candidates:
         try:
             if name is None:
-                return load_dataset(dataset_path, split=split)
-            return load_dataset(dataset_path, name, split=split)
+                return load_dataset(dataset_path, **kwargs)
+            return load_dataset(dataset_path, name, **kwargs)
         except Exception as e:
             errors.append(f"{dataset_path}: {e}")
     joined = "\n".join(errors)
     raise RuntimeError(f"failed to load dataset candidates:\n{joined}")
 
 
-def _load_longbench_v1_rows(load_dataset, *, dataset_name: str):
+def _load_longbench_v1_rows(load_dataset, *, dataset_name: str, revision: str | None = None):
     try:
-        return _load_v1_zip_rows(dataset_name)
+        return _load_v1_zip_rows(dataset_name, revision=revision)
     except Exception as direct_error:
         try:
             return _load_with_fallbacks(
@@ -152,6 +160,7 @@ def _load_longbench_v1_rows(load_dataset, *, dataset_name: str):
                 candidates=("THUDM/LongBench", "zai-org/LongBench"),
                 name=dataset_name,
                 split="test",
+                revision=revision,
             )
         except Exception as dataset_error:
             raise RuntimeError(
@@ -180,14 +189,14 @@ def _load_longbench_v2_rows(load_dataset):
             ) from dataset_error
 
 
-def _load_v1_zip_rows(dataset_name: str) -> list[dict[str, Any]]:
+def _load_v1_zip_rows(dataset_name: str, revision: str | None = None) -> list[dict[str, Any]]:
     from huggingface_hub import hf_hub_download
 
     errors: list[str] = []
     member = f"data/{dataset_name}.jsonl"
     for repo in ("THUDM/LongBench", "zai-org/LongBench"):
         try:
-            path = hf_hub_download(repo, "data.zip", repo_type="dataset")
+            path = hf_hub_download(repo, "data.zip", repo_type="dataset", revision=revision)
             with ZipFile(path) as zf:
                 with zf.open(member) as f:
                     return [json.loads(line.decode("utf-8")) for line in f if line.strip()]

@@ -26,6 +26,10 @@ def main(argv: list[str] | None = None) -> None:
         cmd_checksum_manifest(args)
     elif args.command == "verify-endpoint":
         cmd_verify_endpoint(args)
+    elif args.command == "freeze":
+        cmd_freeze(args)
+    elif args.command == "verify-frozen":
+        cmd_verify_frozen(args)
     elif args.command == "run-offline":
         cmd_run_offline(args)
     elif args.command == "run-live-sglang":
@@ -77,8 +81,10 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = sub.add_parser("build", help="Build a local workload manifest")
     build.add_argument(
-        "--profile", choices=("fixture", "longbench-v1", "longbench-v2"), required=True
+        "--profile", choices=("fixture", "longbench-v1", "longbench-v2"), default=None
     )
+    build.add_argument("--frozen", default=None, help="Build from a frozen spec (e.g. v1)")
+    build.add_argument("--hf-revision", default=None, help="Pin the HF dataset revision")
     build.add_argument("--output", required=True)
     build.add_argument("--datasets", nargs="*", default=None)
     build.add_argument("--max-items-per-dataset", type=int, default=None)
@@ -95,6 +101,16 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--engine", choices=("sglang", "gateway"), required=True)
     verify.add_argument("--base-url", required=True)
     verify.add_argument("--expect-model", default=None)
+
+    freeze = sub.add_parser("freeze", help="Build a frozen spec's manifest and record its checksum")
+    freeze.add_argument("--spec", required=True)
+    freeze.add_argument("--manifests-dir", default="manifests")
+
+    verify_frozen = sub.add_parser(
+        "verify-frozen", help="Rebuild a frozen spec and compare against recorded checksums"
+    )
+    verify_frozen.add_argument("--spec", required=True)
+    verify_frozen.add_argument("--manifests-dir", default="manifests")
 
     offline = sub.add_parser("run-offline", help="Run offline exact-vs-SemBlend metrics")
     _add_run_identity_args(offline)
@@ -186,32 +202,161 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def cmd_build(args) -> None:
-    datasets = args.datasets
-    if args.profile == "longbench-v1" and not datasets:
+def _build_items(
+    *,
+    profile: str,
+    datasets: list[str] | None,
+    max_items_per_dataset: int | None,
+    transforms: tuple[str, ...],
+    max_segments: int,
+    min_segment_chars: int,
+    revision: str | None,
+):
+    if profile == "longbench-v1" and not datasets:
         datasets = list(DEFAULT_LONGBENCH_V1_DATASETS)
     records = load_source_records(
-        profile=args.profile,
+        profile=profile,
         datasets=datasets,
-        max_items_per_dataset=args.max_items_per_dataset,
+        max_items_per_dataset=max_items_per_dataset,
+        revision=revision,
     )
     config = TransformConfig(
-        transforms=tuple(args.transforms),
-        max_segments=args.max_segments,
-        min_segment_chars=args.min_segment_chars,
+        transforms=transforms,
+        max_segments=max_segments,
+        min_segment_chars=min_segment_chars,
     )
-    items = build_workload(records, config)
+    return records, build_workload(records, config)
+
+
+def cmd_build(args) -> None:
+    if args.frozen is not None:
+        from sembench.frozen import get_frozen_spec
+
+        overridden = [
+            flag
+            for flag, given in (
+                ("--profile", args.profile is not None),
+                ("--datasets", bool(args.datasets)),
+                ("--hf-revision", args.hf_revision is not None),
+            )
+            if given
+        ]
+        if overridden:
+            raise SystemExit(
+                f"--frozen pins these inputs; drop {', '.join(overridden)} "
+                "(a frozen build must not be overridable)"
+            )
+        spec = get_frozen_spec(args.frozen)
+        profile = spec.profile
+        datasets = list(spec.datasets)
+        max_items_per_dataset = spec.max_items_per_dataset
+        transforms = spec.transforms
+        max_segments = spec.max_segments
+        min_segment_chars = spec.min_segment_chars
+        revision = spec.hf_revision
+    else:
+        if args.profile is None:
+            raise SystemExit("one of --profile or --frozen is required")
+        profile = args.profile
+        datasets = args.datasets
+        max_items_per_dataset = args.max_items_per_dataset
+        transforms = tuple(args.transforms)
+        max_segments = args.max_segments
+        min_segment_chars = args.min_segment_chars
+        revision = args.hf_revision
+
+    records, items = _build_items(
+        profile=profile,
+        datasets=datasets,
+        max_items_per_dataset=max_items_per_dataset,
+        transforms=transforms,
+        max_segments=max_segments,
+        min_segment_chars=min_segment_chars,
+        revision=revision,
+    )
     write_jsonl(args.output, items)
 
     summary = {
         "output": str(Path(args.output)),
-        "profile": args.profile,
+        "profile": profile,
+        "frozen": args.frozen,
         "source_records": len(records),
         "workload_items": len(items),
         "datasets": sorted({item.dataset for item in items}),
         "transforms": sorted({item.transform for item in items}),
     }
     print(json.dumps(summary, indent=2, sort_keys=True))
+
+
+def _build_frozen_manifest(spec, output_path: Path) -> int:
+    _, items = _build_items(
+        profile=spec.profile,
+        datasets=list(spec.datasets),
+        max_items_per_dataset=spec.max_items_per_dataset,
+        transforms=spec.transforms,
+        max_segments=spec.max_segments,
+        min_segment_chars=spec.min_segment_chars,
+        revision=spec.hf_revision,
+    )
+    write_jsonl(output_path, items)
+    return len(items)
+
+
+def cmd_freeze(args) -> None:
+    from sembench.frozen import get_frozen_spec, write_checksums
+    from sembench.schema import manifest_sha256
+
+    spec = get_frozen_spec(args.spec)
+    manifest_path = Path(args.manifests_dir) / spec.manifest_filename()
+    item_count = _build_frozen_manifest(spec, manifest_path)
+    digest = manifest_sha256(manifest_path)
+    checksums = write_checksums(
+        args.manifests_dir, spec, manifest_sha256=digest, workload_items=item_count
+    )
+    print(
+        json.dumps(
+            {
+                "spec": spec.name,
+                "manifest": str(manifest_path),
+                "sha256": digest,
+                "workload_items": item_count,
+                "checksums": str(checksums),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def cmd_verify_frozen(args) -> None:
+    import tempfile
+
+    from sembench.frozen import get_frozen_spec, read_checksums
+    from sembench.schema import manifest_sha256
+
+    spec = get_frozen_spec(args.spec)
+    recorded = read_checksums(args.manifests_dir, spec)
+    with tempfile.TemporaryDirectory() as tmp:
+        rebuilt = Path(tmp) / spec.manifest_filename()
+        item_count = _build_frozen_manifest(spec, rebuilt)
+        digest = manifest_sha256(rebuilt)
+    passed = digest == recorded["sha256"] and item_count == recorded["workload_items"]
+    print(
+        json.dumps(
+            {
+                "spec": spec.name,
+                "recorded_sha256": recorded["sha256"],
+                "rebuilt_sha256": digest,
+                "recorded_items": recorded["workload_items"],
+                "rebuilt_items": item_count,
+                "passed": passed,
+            },
+            indent=2,
+            sort_keys=True,
+        )
+    )
+    if not passed:
+        raise SystemExit(1)
 
 
 def cmd_run_offline(args) -> None:

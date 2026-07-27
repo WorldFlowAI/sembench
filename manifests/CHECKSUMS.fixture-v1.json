@@ -1,0 +1,27 @@
+{
+  "manifest": "fixture-v1.jsonl",
+  "sha256": "37c8222381a14888ce34faeaa0e4a347c802811c2cb4ded492fdc439e6433482",
+  "spec": {
+    "datasets": [
+      "fixture"
+    ],
+    "hf_revision": null,
+    "max_items_per_dataset": null,
+    "max_segments": 4,
+    "min_segment_chars": 400,
+    "name": "fixture-v1",
+    "profile": "fixture",
+    "tokenizer": "Qwen/Qwen2.5-7B-Instruct",
+    "transforms": [
+      "exact_repeat",
+      "instruction_variant",
+      "same_evidence_new_task",
+      "leading_evidence_new_task",
+      "rag_reorder",
+      "multi_donor_composite",
+      "fuzzy_edit",
+      "negative_control"
+    ]
+  },
+  "workload_items": 16
+}

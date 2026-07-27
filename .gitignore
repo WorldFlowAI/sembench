@@ -4,6 +4,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 manifests/
+!manifests/fixture*.jsonl
+!manifests/CHECKSUMS.*.json
 results/
 
 # Packaging
