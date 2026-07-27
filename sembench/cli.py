@@ -32,6 +32,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_freeze(args)
     elif args.command == "verify-frozen":
         cmd_verify_frozen(args)
+    elif args.command == "calibrate-noise-floor":
+        cmd_calibrate_noise_floor(args)
     elif args.command == "run-offline":
         cmd_run_offline(args)
     elif args.command == "run-live-sglang":
@@ -117,6 +119,21 @@ def build_parser() -> argparse.ArgumentParser:
     freeze.add_argument("--spec", required=True)
     freeze.add_argument("--manifests-dir", default="manifests")
     freeze.add_argument("--block-size", type=int, default=16)
+
+    calibrate = sub.add_parser(
+        "calibrate-noise-floor",
+        help="Measure cold/cold ROUGE-L self-agreement for a live endpoint",
+    )
+    calibrate.add_argument("--manifest", required=True)
+    calibrate.add_argument("--output", required=True)
+    calibrate.add_argument("--base-url", required=True)
+    calibrate.add_argument("--model", required=True)
+    calibrate.add_argument("--max-items", type=int, default=200)
+    calibrate.add_argument("--max-new-tokens", type=int, default=64)
+    calibrate.add_argument("--cooldown-ms", type=int, default=0)
+    calibrate.add_argument("--warmup-requests", type=int, default=2)
+    calibrate.add_argument("--timeout-seconds", type=int, default=3600)
+    calibrate.add_argument("--skip-verify", action="store_true")
 
     verify_frozen = sub.add_parser(
         "verify-frozen", help="Rebuild a frozen spec and compare against recorded checksums"
@@ -217,6 +234,17 @@ def build_parser() -> argparse.ArgumentParser:
     gates.add_argument("--max-negative-control-semantic-placement-rate", type=float, default=1.0)
     gates.add_argument("--require-materialized-reuse", action="store_true")
     gates.add_argument("--require-no-engine-errors", action="store_true")
+    gates.add_argument(
+        "--noise-floor-calibration",
+        default=None,
+        help="Calibration artifact from calibrate-noise-floor",
+    )
+    gates.add_argument(
+        "--max-warm-vs-cold-rouge-drop",
+        type=float,
+        default=None,
+        help="Max allowed drop of paired warm-vs-cold ROUGE-L below the calibrated floor (requires --noise-floor-calibration)",
+    )
 
     return parser
 
@@ -603,9 +631,58 @@ def cmd_collect_k8s_engine_events(args) -> None:
     )
 
 
+def cmd_calibrate_noise_floor(args) -> None:
+    import asyncio
+
+    from sembench.calibration import build_artifact, run_calibration
+    from sembench.schema import read_jsonl
+    from sembench.verify import verify_endpoint
+
+    engine_version = ""
+    if not args.skip_verify:
+        report = verify_endpoint(engine="sglang", base_url=args.base_url, expect_model=args.model)
+        print(json.dumps({"preflight": report.to_dict()}, indent=2, sort_keys=True))
+        if not report.passed:
+            raise SystemExit(3)
+        engine_version = report.engine_version
+
+    items = read_jsonl(args.manifest, max_items=args.max_items)
+
+    async def _run():
+        import aiohttp
+
+        from sembench.sglang_live import _HttpTransport
+
+        timeout = aiohttp.ClientTimeout(total=args.timeout_seconds)
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            transport = _HttpTransport(session=session, base_url=args.base_url.rstrip("/"))
+            return await run_calibration(
+                items=items,
+                transport=transport,
+                max_new_tokens=args.max_new_tokens,
+                cooldown_ms=args.cooldown_ms,
+                warmup_requests=args.warmup_requests,
+            )
+
+    pairs, contaminated, errored = asyncio.run(_run())
+    artifact = build_artifact(
+        pairs=pairs,
+        contaminated=contaminated,
+        errored=errored,
+        model=args.model,
+        engine="sglang",
+        engine_version=engine_version,
+    )
+    out = Path(args.output)
+    out.parent.mkdir(parents=True, exist_ok=True)
+    out.write_text(json.dumps(artifact.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
+    print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
+
+
 def cmd_assert_result_gates(args) -> None:
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
     aggregate = result.get("aggregate") or {}
+    paired = result.get("paired") or {}
     engine_summaries = [
         json.loads(Path(path).read_text(encoding="utf-8")) for path in args.engine_summary
     ]
@@ -687,6 +764,33 @@ def cmd_assert_result_gates(args) -> None:
         )
     if args.require_no_engine_errors:
         require("engine_errors", not engine_errors, f"{len(engine_errors)} errors present")
+
+    warm_vs_cold = paired.get("warm_vs_cold_output_rouge_l_mean")
+    if args.max_warm_vs_cold_rouge_drop is not None:
+        if args.noise_floor_calibration is None:
+            raise SystemExit(
+                "--max-warm-vs-cold-rouge-drop requires --noise-floor-calibration: "
+                "quality gates are calibration-relative, never absolute"
+            )
+        from sembench.calibration import load_calibration
+
+        calibration = load_calibration(args.noise_floor_calibration)
+        floor = calibration.rouge_l_mean - args.max_warm_vs_cold_rouge_drop
+        require(
+            "warm_vs_cold_rouge_vs_floor",
+            warm_vs_cold is not None and float(warm_vs_cold) >= floor,
+            f"{warm_vs_cold} < calibrated floor {calibration.rouge_l_mean:.4f} "
+            f"- allowed drop {args.max_warm_vs_cold_rouge_drop}",
+        )
+        # A warm-vs-cold similarity ABOVE the cold/cold self-agreement band is
+        # itself suspicious (suggests the cold arm was warm): flag, don't pass silently.
+        ceiling = min(1.0, calibration.rouge_l_ci.get("hi", 1.0) + 0.10)
+        if warm_vs_cold is not None and float(warm_vs_cold) > ceiling:
+            require(
+                "warm_vs_cold_rouge_above_plausible_band",
+                False,
+                f"{warm_vs_cold} > {ceiling:.4f} — implausibly high; check cold-arm contamination",
+            )
 
     payload = {
         "result": args.result,
