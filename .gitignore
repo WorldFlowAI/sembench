@@ -5,3 +5,7 @@ __pycache__/
 .venv/
 manifests/
 results/
+
+# Packaging
+sembench.egg-info/
+dist/
