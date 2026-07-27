@@ -31,6 +31,9 @@ class LiveSglangConfig:
     flush_per_item: bool = True
     timeout_seconds: int = 3600
     quality_threshold: float = 0.60
+    paired: bool = False
+    warmup_requests: int = 0
+    cooldown_ms: int = 0
 
 
 async def run_live_sglang(config: LiveSglangConfig) -> list[RequestMetrics]:
@@ -48,34 +51,88 @@ async def run_live_sglang(config: LiveSglangConfig) -> list[RequestMetrics]:
     base_url = config.base_url.rstrip("/")
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        results: list[RequestMetrics] = []
-        for item in items:
-            if config.flush_per_item:
-                await _post_json(session, f"{base_url}/flush_cache", {})
-            for donor in item.donor_prompts:
-                await _send_generate(
-                    session,
-                    f"{base_url}/generate",
-                    donor.text,
-                    config.donor_max_new_tokens,
+        transport = _HttpTransport(session=session, base_url=base_url)
+        return await replay_items(
+            items=items, transport=transport, config=config, tokenizer=tokenizer
+        )
+
+
+class _HttpTransport:
+    """Real SGLang transport; tests substitute a fake with the same surface."""
+
+    def __init__(self, *, session, base_url: str) -> None:
+        self._session = session
+        self._base_url = base_url
+
+    async def flush(self) -> None:
+        await _post_json(self._session, f"{self._base_url}/flush_cache", {})
+
+    async def generate(self, text: str, max_new_tokens: int) -> dict[str, Any]:
+        return await _send_generate(
+            self._session, f"{self._base_url}/generate", text, max_new_tokens
+        )
+
+
+async def replay_items(
+    *,
+    items: list[WorkloadItem],
+    transport,
+    config: LiveSglangConfig,
+    tokenizer,
+) -> list[RequestMetrics]:
+    results: list[RequestMetrics] = []
+    for _ in range(config.warmup_requests):
+        # Warm the serving stack (compilation, allocator, page tables) before
+        # any measured request; responses are discarded.
+        await transport.generate("warmup request please ignore", 8)
+    for item in items:
+        if config.paired:
+            cold = await _run_arm(transport=transport, item=item, config=config, seed_donors=False)
+            results.append(
+                _metrics_from_live_item(
+                    item=item, tokenizer=tokenizer, config=config, response=cold, arm="cold"
                 )
-            if config.post_donor_delay_ms > 0:
-                await asyncio.sleep(config.post_donor_delay_ms / 1000)
-            recipient = await _send_generate(
-                session,
-                f"{base_url}/generate",
-                item.recipient_prompt,
-                config.recipient_max_new_tokens,
+            )
+            if config.cooldown_ms > 0:
+                await asyncio.sleep(config.cooldown_ms / 1000)
+            warm = await _run_arm(transport=transport, item=item, config=config, seed_donors=True)
+            results.append(
+                _metrics_from_live_item(
+                    item=item, tokenizer=tokenizer, config=config, response=warm, arm="warm"
+                )
+            )
+        else:
+            response = await _run_arm(
+                transport=transport,
+                item=item,
+                config=config,
+                seed_donors=True,
+                flush=config.flush_per_item,
             )
             results.append(
                 _metrics_from_live_item(
-                    item=item,
-                    tokenizer=tokenizer,
-                    config=config,
-                    response=recipient,
+                    item=item, tokenizer=tokenizer, config=config, response=response
                 )
             )
-        return results
+    return results
+
+
+async def _run_arm(
+    *,
+    transport,
+    item: WorkloadItem,
+    config: LiveSglangConfig,
+    seed_donors: bool,
+    flush: bool = True,
+) -> dict[str, Any]:
+    if flush:
+        await transport.flush()
+    if seed_donors:
+        for donor in item.donor_prompts:
+            await transport.generate(donor.text, config.donor_max_new_tokens)
+        if config.post_donor_delay_ms > 0:
+            await asyncio.sleep(config.post_donor_delay_ms / 1000)
+    return await transport.generate(item.recipient_prompt, config.recipient_max_new_tokens)
 
 
 def _metrics_from_live_item(
@@ -84,6 +141,7 @@ def _metrics_from_live_item(
     tokenizer,
     config: LiveSglangConfig,
     response: dict[str, Any],
+    arm: str = "single",
 ) -> RequestMetrics:
     donor_tokens = {donor.donor_id: tokenizer.encode(donor.text) for donor in item.donor_prompts}
     recipient_tokens = tokenizer.encode(item.recipient_prompt)
@@ -94,6 +152,10 @@ def _metrics_from_live_item(
 
     cached_tokens = int(response.get("cached_tokens") or 0)
     confirmed_blocks = cached_tokens // config.block_size
+    # A cold arm reporting more than one block of cached tokens means the
+    # flush did not take (stale-cache contamination): the arm's numbers are
+    # untrustworthy and the pair must be excluded from paired aggregates.
+    flush_contaminated = cached_tokens > config.block_size if arm == "cold" else None
     output_text = response.get("output_text") or ""
     answer_score = quality_score(output_text, item.answers)
     quality_pass = answer_score >= config.quality_threshold if answer_score is not None else None
@@ -123,6 +185,8 @@ def _metrics_from_live_item(
         quality_score=answer_score,
         quality_f1=answer_f1,
         quality_rouge_l=answer_rouge,
+        arm=arm,
+        flush_contaminated=flush_contaminated,
         error=response.get("error"),
     )
 

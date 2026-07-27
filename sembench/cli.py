@@ -152,6 +152,13 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--no-flush-per-item", action="store_true")
     live.add_argument("--timeout-seconds", type=int, default=3600)
     live.add_argument("--quality-threshold", type=float, default=0.60)
+    live.add_argument(
+        "--paired",
+        action="store_true",
+        help="Run cold and warm arms per item on the same recipient prompt",
+    )
+    live.add_argument("--warmup-requests", type=int, default=0)
+    live.add_argument("--cooldown-ms", type=int, default=0)
 
     gateway = sub.add_parser(
         "run-live-gateway", help="Replay a manifest through an OpenAI-compatible gateway"
@@ -502,6 +509,9 @@ def cmd_run_live_sglang(args) -> None:
         flush_per_item=not args.no_flush_per_item,
         timeout_seconds=args.timeout_seconds,
         quality_threshold=args.quality_threshold,
+        paired=args.paired,
+        warmup_requests=args.warmup_requests,
+        cooldown_ms=args.cooldown_ms,
     )
     requests = run_live_sglang_sync(config)
     write_result(

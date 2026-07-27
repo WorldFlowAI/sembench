@@ -124,6 +124,48 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
     }
 
 
+def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
+    """Per-item cold/warm pairing: TTFT speedup and warm-vs-cold output
+    similarity. Pairs with a contaminated cold arm are excluded and counted."""
+    cold = {r.item_id: r for r in requests if r.arm == "cold"}
+    warm = {r.item_id: r for r in requests if r.arm == "warm"}
+    if not cold or not warm:
+        return None
+    from sembench.quality import rouge_l
+    from sembench.stats import bootstrap_mean
+
+    speedups: list[float] = []
+    output_rouge: list[float] = []
+    contaminated = 0
+    errored = 0
+    for item_id, cold_row in cold.items():
+        warm_row = warm.get(item_id)
+        if warm_row is None:
+            continue
+        if cold_row.flush_contaminated:
+            contaminated += 1
+            continue
+        if cold_row.error or warm_row.error:
+            errored += 1
+            continue
+        if cold_row.ttft_ms and warm_row.ttft_ms:
+            speedups.append(cold_row.ttft_ms / warm_row.ttft_ms)
+        if cold_row.output_text and warm_row.output_text:
+            output_rouge.append(rouge_l(warm_row.output_text, cold_row.output_text))
+    speedup_ci = bootstrap_mean(speedups)
+    rouge_ci = bootstrap_mean(output_rouge)
+    return {
+        "pairs_total": len(cold),
+        "pairs_used": len(speedups),
+        "pairs_contaminated": contaminated,
+        "pairs_errored": errored,
+        "ttft_speedup_mean": speedup_ci.point if speedup_ci else None,
+        "ttft_speedup_ci": speedup_ci.to_dict() if speedup_ci else None,
+        "warm_vs_cold_output_rouge_l_mean": rouge_ci.point if rouge_ci else None,
+        "warm_vs_cold_output_rouge_l_ci": rouge_ci.to_dict() if rouge_ci else None,
+    }
+
+
 def aggregate_by_transform(requests: list[RequestMetrics]) -> dict[str, dict[str, Any]]:
     groups: dict[str, list[RequestMetrics]] = {}
     for request in requests:
@@ -151,6 +193,7 @@ def write_result(
             "host": platform.node(),
         },
         "aggregate": aggregate_metrics(requests),
+        "paired": paired_summary(requests),
         "by_transform": aggregate_by_transform(requests),
         "requests": [r.to_dict() for r in requests],
     }

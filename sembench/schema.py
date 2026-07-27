@@ -113,6 +113,8 @@ class RequestMetrics:
     quality_score: float | None = None
     quality_f1: float | None = None
     quality_rouge_l: float | None = None
+    arm: str = "single"
+    flush_contaminated: bool | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
