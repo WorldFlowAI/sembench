@@ -34,6 +34,12 @@ def load_source_records(
     """Load normalized source records for a profile."""
     if profile == "fixture":
         return fixture_records()
+    if profile == "synthetic-v1":
+        from sembench.synthetic import synthetic_records
+
+        return synthetic_records(
+            sources_per_domain=max_items_per_dataset or 80,
+        )
     if profile == "longbench-v1":
         return load_longbench_v1(
             datasets=datasets or list(DEFAULT_LONGBENCH_V1_DATASETS),

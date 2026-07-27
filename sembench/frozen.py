@@ -68,7 +68,23 @@ FROZEN_V1 = FrozenSpec(
     tokenizer="Qwen/Qwen2.5-7B-Instruct",
 )
 
-FROZEN_SPECS: dict[str, FrozenSpec] = {spec.name: spec for spec in (FROZEN_FIXTURE_V1, FROZEN_V1)}
+# Original synthetic corpus (redistributable); small default freeze uses a
+# reduced source count until the full corpus freeze is approved.
+FROZEN_SYNTHETIC_V1 = FrozenSpec(
+    name="synthetic-v1",
+    profile="synthetic-v1",
+    datasets=("synthetic-enterprise-v1",),
+    transforms=tuple(DEFAULT_TRANSFORMS),
+    max_items_per_dataset=80,
+    max_segments=4,
+    min_segment_chars=400,
+    hf_revision=None,
+    tokenizer="Qwen/Qwen2.5-7B-Instruct",
+)
+
+FROZEN_SPECS: dict[str, FrozenSpec] = {
+    spec.name: spec for spec in (FROZEN_FIXTURE_V1, FROZEN_V1, FROZEN_SYNTHETIC_V1)
+}
 
 
 def get_frozen_spec(name: str) -> FrozenSpec:

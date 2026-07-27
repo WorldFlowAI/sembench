@@ -55,7 +55,9 @@ jobs:
             --result /tmp/fixture-offline.json \
             --max-negative-control-semantic-placement-rate 0.0
       - name: Frozen-spec integrity (rebuild matches committed checksums)
-        run: python -m sembench verify-frozen --spec fixture-v1
+        run: |
+          python -m sembench verify-frozen --spec fixture-v1
+          python -m sembench verify-frozen --spec synthetic-v1
 
   build:
     runs-on: ubuntu-latest

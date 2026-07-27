@@ -83,7 +83,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     build = sub.add_parser("build", help="Build a local workload manifest")
     build.add_argument(
-        "--profile", choices=("fixture", "longbench-v1", "longbench-v2"), default=None
+        "--profile",
+        choices=("fixture", "synthetic-v1", "longbench-v1", "longbench-v2"),
+        default=None,
     )
     build.add_argument("--frozen", default=None, help="Build from a frozen spec (e.g. v1)")
     build.add_argument("--hf-revision", default=None, help="Pin the HF dataset revision")
