@@ -108,6 +108,14 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
             [r.semblend_latency_ms for r in requests if r.semblend_latency_ms > 0]
         ),
         "mean_ttft_ms": _mean([r.ttft_ms for r in requests if r.ttft_ms is not None]),
+        "mean_quality_f1": _mean([r.quality_f1 for r in requests if r.quality_f1 is not None]),
+        "mean_quality_rouge_l": _mean(
+            [r.quality_rouge_l for r in requests if r.quality_rouge_l is not None]
+        ),
+        "quality_f1_ci": _ci([r.quality_f1 for r in requests if r.quality_f1 is not None]),
+        "quality_rouge_l_ci": _ci(
+            [r.quality_rouge_l for r in requests if r.quality_rouge_l is not None]
+        ),
         "quality_pass_rate": (
             _rate(sum(1 for v in quality_values if v), len(quality_values))
             if quality_values
@@ -153,6 +161,13 @@ def _rate(numerator: int | float, denominator: int | float) -> float:
     if denominator == 0:
         return 0.0
     return float(numerator) / float(denominator)
+
+
+def _ci(values: list[float]) -> dict[str, float] | None:
+    from sembench.stats import bootstrap_mean
+
+    result = bootstrap_mean(values)
+    return result.to_dict() if result is not None else None
 
 
 def _mean(values: list[float]) -> float | None:

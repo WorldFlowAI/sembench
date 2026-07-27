@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from sembench.exact_cache import ExactBlockIndex, full_block_tokens
-from sembench.quality import quality_score
+from sembench.quality import quality_score, rouge_l_best, token_f1
 from sembench.schema import RequestMetrics, WorkloadItem, read_jsonl
 from sembench.tokenization import load_tokenizer
 
@@ -97,6 +97,8 @@ def _metrics_from_live_item(
     output_text = response.get("output_text") or ""
     answer_score = quality_score(output_text, item.answers)
     quality_pass = answer_score >= config.quality_threshold if answer_score is not None else None
+    answer_f1 = token_f1(output_text, item.answers)
+    answer_rouge = rouge_l_best(output_text, item.answers)
 
     return RequestMetrics(
         item_id=item.item_id,
@@ -119,6 +121,8 @@ def _metrics_from_live_item(
         output_text=output_text[:2000],
         quality_pass=quality_pass,
         quality_score=answer_score,
+        quality_f1=answer_f1,
+        quality_rouge_l=answer_rouge,
         error=response.get("error"),
     )
 

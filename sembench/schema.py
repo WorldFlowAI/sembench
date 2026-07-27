@@ -111,6 +111,8 @@ class RequestMetrics:
     output_text: str | None = None
     quality_pass: bool | None = None
     quality_score: float | None = None
+    quality_f1: float | None = None
+    quality_rouge_l: float | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
