@@ -47,7 +47,9 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command")
 
     build = sub.add_parser("build", help="Build a local workload manifest")
-    build.add_argument("--profile", choices=("fixture", "longbench-v1", "longbench-v2"), required=True)
+    build.add_argument(
+        "--profile", choices=("fixture", "longbench-v1", "longbench-v2"), required=True
+    )
     build.add_argument("--output", required=True)
     build.add_argument("--datasets", nargs="*", default=None)
     build.add_argument("--max-items-per-dataset", type=int, default=None)
@@ -82,7 +84,9 @@ def build_parser() -> argparse.ArgumentParser:
     live.add_argument("--timeout-seconds", type=int, default=3600)
     live.add_argument("--quality-threshold", type=float, default=0.60)
 
-    gateway = sub.add_parser("run-live-gateway", help="Replay a manifest through an OpenAI-compatible gateway")
+    gateway = sub.add_parser(
+        "run-live-gateway", help="Replay a manifest through an OpenAI-compatible gateway"
+    )
     gateway.add_argument("--manifest", required=True)
     gateway.add_argument("--output", required=True)
     gateway.add_argument("--gateway-url", required=True)
@@ -300,8 +304,7 @@ def cmd_assert_result_gates(args) -> None:
     result = json.loads(Path(args.result).read_text(encoding="utf-8"))
     aggregate = result.get("aggregate") or {}
     engine_summaries = [
-        json.loads(Path(path).read_text(encoding="utf-8"))
-        for path in args.engine_summary
+        json.loads(Path(path).read_text(encoding="utf-8")) for path in args.engine_summary
     ]
     failures: list[str] = []
 
@@ -340,33 +343,23 @@ def cmd_assert_result_gates(args) -> None:
     if negative_semantic_placement is not None:
         require(
             "negative_control_semantic_placement_rate",
-            float(negative_semantic_placement)
-            <= args.max_negative_control_semantic_placement_rate,
-            f"{negative_semantic_placement} > "
-            f"{args.max_negative_control_semantic_placement_rate}",
+            float(negative_semantic_placement) <= args.max_negative_control_semantic_placement_rate,
+            f"{negative_semantic_placement} > {args.max_negative_control_semantic_placement_rate}",
         )
 
     materialization_events = sum(
-        int(summary.get("materialization_events") or 0)
-        for summary in engine_summaries
+        int(summary.get("materialization_events") or 0) for summary in engine_summaries
     )
     materialized_tokens = sum(
-        int(summary.get("materialized_tokens") or 0)
-        for summary in engine_summaries
+        int(summary.get("materialized_tokens") or 0) for summary in engine_summaries
     )
     materialized_units = sum(
-        int(summary.get("materialized_units") or 0)
-        for summary in engine_summaries
+        int(summary.get("materialized_units") or 0) for summary in engine_summaries
     )
     materialized_reuse = any(
-        bool(summary.get("materialized_semantic_kv_reuse"))
-        for summary in engine_summaries
+        bool(summary.get("materialized_semantic_kv_reuse")) for summary in engine_summaries
     )
-    engine_errors = [
-        error
-        for summary in engine_summaries
-        for error in summary.get("errors", [])
-    ]
+    engine_errors = [error for summary in engine_summaries for error in summary.get("errors", [])]
 
     require(
         "materialization_events",

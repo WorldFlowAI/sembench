@@ -39,8 +39,7 @@ async def run_live_sglang(config: LiveSglangConfig) -> list[RequestMetrics]:
         import aiohttp
     except ImportError as e:
         raise RuntimeError(
-            "live SGLang replay requires aiohttp. Install with: "
-            "python -m pip install -e '.[live]'"
+            "live SGLang replay requires aiohttp. Install with: python -m pip install -e '.[live]'"
         ) from e
 
     items = read_jsonl(config.manifest, max_items=config.max_items)
@@ -97,11 +96,7 @@ def _metrics_from_live_item(
     confirmed_blocks = cached_tokens // config.block_size
     output_text = response.get("output_text") or ""
     answer_score = quality_score(output_text, item.answers)
-    quality_pass = (
-        answer_score >= config.quality_threshold
-        if answer_score is not None
-        else None
-    )
+    quality_pass = answer_score >= config.quality_threshold if answer_score is not None else None
 
     return RequestMetrics(
         item_id=item.item_id,

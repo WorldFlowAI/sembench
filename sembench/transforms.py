@@ -213,9 +213,7 @@ def _same_evidence_task_prompt(context: str, request: str) -> str:
 
 def _leading_evidence_donor_prompt(context: str) -> str:
     return (
-        "Reusable enterprise evidence cache entry\n\n"
-        f"{context.strip()}\n\n"
-        "Cached evidence summary:"
+        f"Reusable enterprise evidence cache entry\n\n{context.strip()}\n\nCached evidence summary:"
     )
 
 
@@ -233,8 +231,7 @@ def _rag_reorder_prompt(segments: list[str], request: str) -> str:
     parts = ["Retrieved enterprise knowledge bundle"]
     for idx, segment in enumerate(rotated):
         parts.append(
-            f"\n[retrieved_record id=R{idx + 1:02d} source=knowledge_base]\n"
-            f"{segment.strip()}"
+            f"\n[retrieved_record id=R{idx + 1:02d} source=knowledge_base]\n{segment.strip()}"
         )
     parts.append(
         "\nUsing the retrieved records, answer the request with citations to "
@@ -246,11 +243,7 @@ def _rag_reorder_prompt(segments: list[str], request: str) -> str:
 
 
 def _segment_donor_prompt(segment: str, idx: int) -> str:
-    return (
-        f"Cached enterprise evidence segment {idx + 1}\n\n"
-        f"{segment.strip()}\n\n"
-        "Segment summary:"
-    )
+    return f"Cached enterprise evidence segment {idx + 1}\n\n{segment.strip()}\n\nSegment summary:"
 
 
 def _multi_donor_prompt(segments: list[str], request: str) -> str:

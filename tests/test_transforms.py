@@ -23,8 +23,7 @@ def test_multi_donor_composite_uses_segment_donors():
 
 def test_leading_evidence_transform_places_reusable_span_at_target_prefix():
     item = next(
-        i for i in build_workload(fixture_records())
-        if i.transform == "leading_evidence_new_task"
+        i for i in build_workload(fixture_records()) if i.transform == "leading_evidence_new_task"
     )
 
     donor_text = item.donor_prompts[0].text

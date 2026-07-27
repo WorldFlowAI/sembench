@@ -198,16 +198,10 @@ def _metrics_from_item(
     )
     output_text = response.get("output_text") or ""
     answer_score = quality_score(output_text, item.answers)
-    quality_pass = (
-        answer_score >= config.quality_threshold
-        if answer_score is not None
-        else None
-    )
+    quality_pass = answer_score >= config.quality_threshold if answer_score is not None else None
     headers = response.get("headers") or {}
     route_header = (
-        headers.get("x-semantic-route")
-        or headers.get("x-gateway-route")
-        or headers.get("x-route")
+        headers.get("x-semantic-route") or headers.get("x-gateway-route") or headers.get("x-route")
     )
 
     return RequestMetrics(

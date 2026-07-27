@@ -31,13 +31,9 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
 
     confirmed_values = [r.backend_confirmed_blocks for r in requests]
     has_confirmed = any(v is not None for v in confirmed_values)
-    confirmed_blocks = (
-        sum(v or 0 for v in confirmed_values) if has_confirmed else None
-    )
+    confirmed_blocks = sum(v or 0 for v in confirmed_values) if has_confirmed else None
     confirmed_tokens_values = [r.backend_confirmed_tokens for r in requests]
-    confirmed_tokens = (
-        sum(v or 0 for v in confirmed_tokens_values) if has_confirmed else None
-    )
+    confirmed_tokens = sum(v or 0 for v in confirmed_tokens_values) if has_confirmed else None
 
     negative = [r for r in requests if r.negative_control]
     negative_blocks = sum(r.total_blocks for r in negative)

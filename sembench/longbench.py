@@ -190,11 +190,7 @@ def _load_v1_zip_rows(dataset_name: str) -> list[dict[str, Any]]:
             path = hf_hub_download(repo, "data.zip", repo_type="dataset")
             with ZipFile(path) as zf:
                 with zf.open(member) as f:
-                    return [
-                        json.loads(line.decode("utf-8"))
-                        for line in f
-                        if line.strip()
-                    ]
+                    return [json.loads(line.decode("utf-8")) for line in f if line.strip()]
         except Exception as exc:
             errors.append(f"{repo}/{member}: {exc}")
     raise RuntimeError("; ".join(errors))
