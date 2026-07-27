@@ -26,6 +26,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_checksum_manifest(args)
     elif args.command == "verify-endpoint":
         cmd_verify_endpoint(args)
+    elif args.command == "audit-manifest":
+        cmd_audit_manifest(args)
     elif args.command == "freeze":
         cmd_freeze(args)
     elif args.command == "verify-frozen":
@@ -102,9 +104,17 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--base-url", required=True)
     verify.add_argument("--expect-model", default=None)
 
+    audit = sub.add_parser(
+        "audit-manifest", help="Check a manifest for phantom cross-item block collisions"
+    )
+    audit.add_argument("--manifest", required=True)
+    audit.add_argument("--block-size", type=int, default=16)
+    audit.add_argument("--tokenizer", default=None)
+
     freeze = sub.add_parser("freeze", help="Build a frozen spec's manifest and record its checksum")
     freeze.add_argument("--spec", required=True)
     freeze.add_argument("--manifests-dir", default="manifests")
+    freeze.add_argument("--block-size", type=int, default=16)
 
     verify_frozen = sub.add_parser(
         "verify-frozen", help="Rebuild a frozen spec and compare against recorded checksums"
@@ -302,13 +312,34 @@ def _build_frozen_manifest(spec, output_path: Path) -> int:
     return len(items)
 
 
+def cmd_audit_manifest(args) -> None:
+    from sembench.collision_audit import audit_manifest_items
+    from sembench.schema import read_jsonl
+
+    report = audit_manifest_items(
+        read_jsonl(args.manifest),
+        block_size=args.block_size,
+        tokenizer_name=args.tokenizer,
+    )
+    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
+    if not report.passed:
+        raise SystemExit(1)
+
+
 def cmd_freeze(args) -> None:
+    from sembench.collision_audit import audit_manifest_items
     from sembench.frozen import get_frozen_spec, write_checksums
-    from sembench.schema import manifest_sha256
+    from sembench.schema import manifest_sha256, read_jsonl
 
     spec = get_frozen_spec(args.spec)
     manifest_path = Path(args.manifests_dir) / spec.manifest_filename()
     item_count = _build_frozen_manifest(spec, manifest_path)
+    audit = audit_manifest_items(read_jsonl(manifest_path), block_size=args.block_size)
+    if not audit.passed:
+        print(json.dumps(audit.to_dict(), indent=2, sort_keys=True))
+        raise SystemExit(
+            f"collision audit failed: {len(audit.violations)} violations — not freezing"
+        )
     digest = manifest_sha256(manifest_path)
     checksums = write_checksums(
         args.manifests_dir, spec, manifest_sha256=digest, workload_items=item_count
