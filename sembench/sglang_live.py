@@ -131,6 +131,9 @@ async def replay_items(
 ) -> list[RequestMetrics]:
     results: list[RequestMetrics] = list(load_checkpoint(config))
     done = {_completed_key(row) for row in results}
+    import os
+
+    os.makedirs(os.path.dirname(os.path.abspath(_checkpoint_path(config))) or ".", exist_ok=True)
     checkpoint = open(_checkpoint_path(config), "a", encoding="utf-8")
 
     def record(row: RequestMetrics) -> None:
