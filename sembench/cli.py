@@ -211,7 +211,7 @@ def build_parser() -> argparse.ArgumentParser:
         "summarize-engine-events",
         help="Summarize backend log/audit evidence for semantic KV reuse",
     )
-    events.add_argument("--engine", choices=("vllm", "sglang", "trtllm"), required=True)
+    events.add_argument("--engine", choices=("vllm", "sglang", "trtllm", "lmcache"), required=True)
     events.add_argument("--input", required=True)
     events.add_argument("--output", default=None)
 
@@ -219,7 +219,7 @@ def build_parser() -> argparse.ArgumentParser:
         "collect-k8s-engine-events",
         help="Collect pod logs and summarize backend-confirmed semantic KV reuse",
     )
-    collect.add_argument("--engine", choices=("vllm", "sglang", "trtllm"), required=True)
+    collect.add_argument("--engine", choices=("vllm", "sglang", "trtllm", "lmcache"), required=True)
     collect.add_argument("--namespace", required=True)
     collect.add_argument("--pod", required=True)
     collect.add_argument("--container", default=None)

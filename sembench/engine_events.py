@@ -63,6 +63,23 @@ SGLANG_SEGMENTED_PHASE_RE = re.compile(
     r"direct_paged_kv=(?P<direct_paged_kv>\S+)",
     re.IGNORECASE,
 )
+# LMCache log families (format drifts across versions — fixtures pin each
+# supported version; see tests/fixtures/lmcache/). LMCache is an EXACT-reuse
+# baseline: retrieved tokens are engine-confirmed reuse, but semantic_hits
+# stays 0 by definition, so `materialized_semantic_kv_reuse` is False for
+# LMCache rows — the flag means what it says.
+LMCACHE_RETRIEVE_RE = re.compile(
+    r"(?:Retrieved|Reusing)\s+(?P<tokens>\d+)\s*(?:/|out of)\s*(?P<total>\d+)",
+    re.IGNORECASE,
+)
+LMCACHE_STORE_RE = re.compile(
+    r"Stor(?:ed|ing)\s+(?P<tokens>\d+)\s+(?:new\s+)?tokens",
+    re.IGNORECASE,
+)
+LMCACHE_HIT_RE = re.compile(
+    r"(?:cache\s+hit|lookup\s+hit).*?tokens[=:\s]+(?P<tokens>\d+)",
+    re.IGNORECASE,
+)
 RUNTIME_WARNING_MARKERS = (
     "[E:onnxruntime:",
     "Non-zero status code returned",
@@ -110,7 +127,43 @@ def parse_engine_events(engine: str, text: str) -> EngineReuseSummary:
         return parse_trtllm_audit_jsonl(text)
     if normalized == "sglang":
         return parse_sglang_logs(text)
+    if normalized == "lmcache":
+        return parse_lmcache_logs(text)
     raise ValueError(f"unknown engine: {engine}")
+
+
+def parse_lmcache_logs(logs: str) -> EngineReuseSummary:
+    """Engine-confirmed EXACT reuse from LMCache-integrated serving logs."""
+    events: dict[str, list[dict[str, Any]]] = {
+        "retrieved": [],
+        "stored": [],
+        "hits": [],
+    }
+    errors: list[str] = []
+    runtime_warnings: list[str] = []
+    for line in logs.splitlines():
+        for key, pattern in (
+            ("retrieved", LMCACHE_RETRIEVE_RE),
+            ("stored", LMCACHE_STORE_RE),
+            ("hits", LMCACHE_HIT_RE),
+        ):
+            match = pattern.search(line)
+            if match:
+                events[key].append(match.groupdict())
+        if "ERROR" in line or "Traceback" in line:
+            errors.append(line)
+        elif _is_runtime_warning(line):
+            runtime_warnings.append(line)
+    return EngineReuseSummary(
+        engine="lmcache",
+        donor_registrations=len(events["stored"]),
+        semantic_hits=0,  # exact-reuse baseline: never semantic by definition
+        materialization_events=len(events["retrieved"]),
+        materialized_tokens=sum(_int(event.get("tokens")) for event in events["retrieved"]),
+        errors=errors,
+        runtime_warnings=runtime_warnings,
+        events=events,
+    )
 
 
 def parse_vllm_logs(logs: str) -> EngineReuseSummary:

@@ -139,3 +139,43 @@ def test_parse_engine_events_dispatches_aliases() -> None:
 
     assert summary.engine == "trtllm"
     assert summary.semantic_hits == 1
+
+
+class TestLmcacheParser:
+    LOGS_V05 = """
+INFO 07-28 lmcache.integration: Retrieved 4096 / 8192 tokens for request r1
+INFO 07-28 lmcache.integration: Storing 8192 new tokens for request r1
+INFO 07-28 lmcache.integration: Retrieved 0 / 4096 tokens for request r2
+"""
+    LOGS_ALT = """
+[LMCache] Reusing 2048 out of 4096 tokens
+[LMCache] cache hit for request r3, tokens: 2048
+[LMCache] Stored 4096 tokens
+"""
+
+    def test_v05_family(self):
+        from sembench.engine_events import parse_engine_events
+
+        summary = parse_engine_events("lmcache", self.LOGS_V05)
+        assert summary.engine == "lmcache"
+        assert summary.materialization_events == 2
+        assert summary.materialized_tokens == 4096  # 4096 + 0
+        assert summary.donor_registrations == 1
+        # Exact-reuse baseline is never SEMANTIC reuse:
+        assert summary.semantic_hits == 0
+        assert summary.materialized_semantic_kv_reuse is False
+
+    def test_alt_family(self):
+        from sembench.engine_events import parse_engine_events
+
+        summary = parse_engine_events("lmcache", self.LOGS_ALT)
+        assert summary.materialization_events == 1
+        assert summary.materialized_tokens == 2048
+        assert summary.donor_registrations == 1
+        assert len(summary.events["hits"]) == 1
+
+    def test_errors_collected(self):
+        from sembench.engine_events import parse_engine_events
+
+        summary = parse_engine_events("lmcache", "ERROR something broke\n")
+        assert summary.errors
