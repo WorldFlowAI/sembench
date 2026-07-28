@@ -1,0 +1,40 @@
+{
+  "calibration_version": "sembench.calibration.v1",
+  "created_at_utc": "2026-07-28T00:42:31Z",
+  "engine": "sglang",
+  "engine_version": "0.5.16",
+  "model": "Qwen/Qwen2.5-7B-Instruct",
+  "n_pairs": 149,
+  "pairs_contaminated": 1,
+  "pairs_errored": 0,
+  "per_length_band": {
+    "12k": {
+      "mean": 1.0,
+      "n": 31.0
+    },
+    "16k": {
+      "mean": 1.0,
+      "n": 38.0
+    },
+    "2k": {
+      "mean": 1.0,
+      "n": 32.0
+    },
+    "4k": {
+      "mean": 1.0,
+      "n": 8.0
+    },
+    "8k": {
+      "mean": 1.0,
+      "n": 40.0
+    }
+  },
+  "rouge_l_ci": {
+    "hi": 1.0,
+    "lo": 1.0,
+    "point": 1.0
+  },
+  "rouge_l_mean": 1.0,
+  "rouge_l_p05": 1.0,
+  "rouge_l_p50": 1.0
+}
