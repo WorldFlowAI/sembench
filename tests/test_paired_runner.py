@@ -75,8 +75,13 @@ def _run(config: LiveSglangConfig, transport: FakeTransport, items=None):
     )
 
 
-def _config(**kw) -> LiveSglangConfig:
-    return LiveSglangConfig(manifest="x", output="y", base_url="http://h", model="m", **kw)
+def _config(tmp_path=None, **kw) -> LiveSglangConfig:
+    import tempfile
+
+    out_dir = str(tmp_path) if tmp_path is not None else tempfile.mkdtemp()
+    return LiveSglangConfig(
+        manifest="x", output=f"{out_dir}/result.json", base_url="http://h", model="m", **kw
+    )
 
 
 def test_paired_mode_runs_cold_then_warm_per_item():
@@ -143,3 +148,48 @@ def test_negative_control_pairs_tracked_separately():
     assert summary["negative_control_ttft_speedup_mean"] == 5.0
     assert summary["ttft_cold_p50_ms"] == 200.0
     assert summary["ttft_warm_p50_ms"] == 40.0
+
+
+def test_resume_skips_completed_pairs(tmp_path):
+    config = _config(tmp_path, paired=True, resume=True)
+    items = [_item("i1"), _item("i2")]
+
+    first = FakeTransport()
+    rows = _run(config, first, items=items)
+    assert len(rows) == 4  # both pairs completed and checkpointed
+
+    second = FakeTransport()
+    rows2 = _run(config, second, items=items)
+    # All rows come back (from checkpoint), but NO new engine calls were made.
+    assert len(rows2) == 4
+    assert second.calls == []
+
+
+def test_resume_reruns_incomplete_pair(tmp_path):
+    import json as _json
+
+    config = _config(tmp_path, paired=True, resume=True)
+    items = [_item("i1")]
+    _run(config, FakeTransport(), items=items)
+
+    # Drop the warm row from the checkpoint → pair incomplete → full rerun.
+    ckpt = f"{config.output}.partial.jsonl"
+    lines = [line for line in open(ckpt).read().splitlines() if _json.loads(line)["arm"] != "warm"]
+    open(ckpt, "w").write("\n".join(lines) + "\n")
+
+    transport = FakeTransport()
+    rows = _run(config, transport, items=items)
+    assert transport.calls != []  # pair was rerun
+    warm_rows = [r for r in rows if r.arm == "warm"]
+    assert len(warm_rows) == 1
+
+
+def test_no_resume_flag_ignores_existing_checkpoint(tmp_path):
+    config = _config(tmp_path, paired=True, resume=False)
+    items = [_item("i1")]
+    _run(config, FakeTransport(), items=items)
+    transport = FakeTransport()
+    rows = _run(config, transport, items=items)
+    assert transport.calls != []  # reran because resume is off
+    # Checkpoint had 2 rows from run 1 + 2 appended in run 2; results list only run-2 rows.
+    assert len(rows) == 2

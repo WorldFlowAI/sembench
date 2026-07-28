@@ -36,6 +36,7 @@ class LiveSglangConfig:
     cooldown_ms: int = 0
     capture_logprobs: bool = False
     top_logprobs_num: int = 8
+    resume: bool = False
 
 
 async def run_live_sglang(config: LiveSglangConfig) -> list[RequestMetrics]:
@@ -89,6 +90,38 @@ class _HttpTransport:
         )
 
 
+def _checkpoint_path(config: LiveSglangConfig) -> str:
+    return f"{config.output}.partial.jsonl"
+
+
+def load_checkpoint(config: LiveSglangConfig) -> list[RequestMetrics]:
+    """Rows already completed in a previous interrupted run."""
+    import os
+
+    from sembench.schema import RequestMetrics as RM
+
+    path = _checkpoint_path(config)
+    if not (config.resume and os.path.exists(path)):
+        return []
+    rows: list[RequestMetrics] = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                raw = json.loads(line)
+                raw["output_top_logprobs"] = (
+                    [[tuple(entry) for entry in pos] for pos in raw["output_top_logprobs"]]
+                    if raw.get("output_top_logprobs")
+                    else None
+                )
+                rows.append(RM(**raw))
+    return rows
+
+
+def _completed_key(row: RequestMetrics) -> tuple[str, str]:
+    return (row.item_id, row.arm)
+
+
 async def replay_items(
     *,
     items: list[WorkloadItem],
@@ -96,40 +129,59 @@ async def replay_items(
     config: LiveSglangConfig,
     tokenizer,
 ) -> list[RequestMetrics]:
-    results: list[RequestMetrics] = []
+    results: list[RequestMetrics] = list(load_checkpoint(config))
+    done = {_completed_key(row) for row in results}
+    checkpoint = open(_checkpoint_path(config), "a", encoding="utf-8")
+
+    def record(row: RequestMetrics) -> None:
+        results.append(row)
+        checkpoint.write(json.dumps(row.to_dict(), sort_keys=True) + "\n")
+        checkpoint.flush()
+
     for _ in range(config.warmup_requests):
         # Warm the serving stack (compilation, allocator, page tables) before
         # any measured request; responses are discarded.
         await transport.generate("warmup request please ignore", 8)
-    for item in items:
-        if config.paired:
-            cold = await _run_arm(transport=transport, item=item, config=config, seed_donors=False)
-            results.append(
-                _metrics_from_live_item(
+    try:
+        for item in items:
+            if config.paired:
+                # Resume at pair granularity: a pair missing either arm reruns
+                # whole (arms are only comparable from the same session).
+                if (item.item_id, "cold") in done and (item.item_id, "warm") in done:
+                    continue
+                cold = await _run_arm(
+                    transport=transport, item=item, config=config, seed_donors=False
+                )
+                cold_row = _metrics_from_live_item(
                     item=item, tokenizer=tokenizer, config=config, response=cold, arm="cold"
                 )
-            )
-            if config.cooldown_ms > 0:
-                await asyncio.sleep(config.cooldown_ms / 1000)
-            warm = await _run_arm(transport=transport, item=item, config=config, seed_donors=True)
-            results.append(
-                _metrics_from_live_item(
+                if config.cooldown_ms > 0:
+                    await asyncio.sleep(config.cooldown_ms / 1000)
+                warm = await _run_arm(
+                    transport=transport, item=item, config=config, seed_donors=True
+                )
+                warm_row = _metrics_from_live_item(
                     item=item, tokenizer=tokenizer, config=config, response=warm, arm="warm"
                 )
-            )
-        else:
-            response = await _run_arm(
-                transport=transport,
-                item=item,
-                config=config,
-                seed_donors=True,
-                flush=config.flush_per_item,
-            )
-            results.append(
-                _metrics_from_live_item(
-                    item=item, tokenizer=tokenizer, config=config, response=response
+                record(cold_row)
+                record(warm_row)
+            else:
+                if (item.item_id, "single") in done:
+                    continue
+                response = await _run_arm(
+                    transport=transport,
+                    item=item,
+                    config=config,
+                    seed_donors=True,
+                    flush=config.flush_per_item,
                 )
-            )
+                record(
+                    _metrics_from_live_item(
+                        item=item, tokenizer=tokenizer, config=config, response=response
+                    )
+                )
+    finally:
+        checkpoint.close()
     return results
 
 

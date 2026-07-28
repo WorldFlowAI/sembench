@@ -182,6 +182,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Capture per-token top-k logprobs for warm-vs-cold KL analysis",
     )
     live.add_argument("--top-logprobs-num", type=int, default=8)
+    live.add_argument(
+        "--resume",
+        action="store_true",
+        help="Skip items already completed in <output>.partial.jsonl from an interrupted run",
+    )
 
     gateway = sub.add_parser(
         "run-live-gateway", help="Replay a manifest through an OpenAI-compatible gateway"
@@ -560,6 +565,7 @@ def cmd_run_live_sglang(args) -> None:
         cooldown_ms=args.cooldown_ms,
         capture_logprobs=args.capture_logprobs,
         top_logprobs_num=args.top_logprobs_num,
+        resume=args.resume,
     )
     requests = run_live_sglang_sync(config)
     write_result(
