@@ -234,6 +234,18 @@ def build_parser() -> argparse.ArgumentParser:
     gates.add_argument("--max-negative-control-semantic-placement-rate", type=float, default=1.0)
     gates.add_argument("--require-materialized-reuse", action="store_true")
     gates.add_argument("--require-no-engine-errors", action="store_true")
+    gates.add_argument("--min-blended-ttft-speedup", type=float, default=None)
+    gates.add_argument(
+        "--max-negative-control-speedup-deviation",
+        type=float,
+        default=None,
+        help="Max allowed |negative-control speedup - 1.0| (cache must not fire on unrelated content)",
+    )
+    gates.add_argument(
+        "--require-contamination-check",
+        action="store_true",
+        help="Fail if any paired cold arm was flush-contaminated",
+    )
     gates.add_argument(
         "--noise-floor-calibration",
         default=None,
@@ -764,6 +776,28 @@ def cmd_assert_result_gates(args) -> None:
         )
     if args.require_no_engine_errors:
         require("engine_errors", not engine_errors, f"{len(engine_errors)} errors present")
+
+    if args.min_blended_ttft_speedup is not None:
+        blended = paired.get("blended_ttft_speedup_mean")
+        require(
+            "blended_ttft_speedup",
+            blended is not None and float(blended) >= args.min_blended_ttft_speedup,
+            f"{blended} < {args.min_blended_ttft_speedup}",
+        )
+    if args.max_negative_control_speedup_deviation is not None:
+        negative_speedup = paired.get("negative_control_ttft_speedup_mean")
+        if negative_speedup is not None:
+            require(
+                "negative_control_ttft_speedup",
+                abs(float(negative_speedup) - 1.0) <= args.max_negative_control_speedup_deviation,
+                f"|{negative_speedup} - 1.0| > {args.max_negative_control_speedup_deviation}",
+            )
+    if args.require_contamination_check:
+        require(
+            "paired_contamination",
+            paired.get("pairs_contaminated") == 0,
+            f"{paired.get('pairs_contaminated')} contaminated pairs present",
+        )
 
     warm_vs_cold = paired.get("warm_vs_cold_output_rouge_l_mean")
     if args.max_warm_vs_cold_rouge_drop is not None:

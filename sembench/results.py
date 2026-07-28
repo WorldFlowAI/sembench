@@ -124,9 +124,30 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
     }
 
 
+def _pctl(values: list[float], pct: float) -> float | None:
+    if not values:
+        return None
+    ordered = sorted(values)
+    rank = (pct / 100.0) * (len(ordered) - 1)
+    low = int(rank)
+    high = min(low + 1, len(ordered) - 1)
+    frac = rank - low
+    return ordered[low] * (1 - frac) + ordered[high] * frac
+
+
 def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
-    """Per-item cold/warm pairing: TTFT speedup and warm-vs-cold output
-    similarity. Pairs with a contaminated cold arm are excluded and counted."""
+    """Per-item cold/warm pairing: TTFT speedups and warm-vs-cold output
+    similarity. Pairs with a contaminated cold arm are excluded and counted.
+
+    Speedup semantics (the honesty split):
+    - blended: EVERY clean pair contributes; a pair with no confirmed reuse
+      in the warm arm contributes its real ratio (typically ~1.0). This is
+      the headline number.
+    - hit-only: pairs whose warm arm had backend-confirmed reuse. Meaningful
+      ONLY next to hit_rate — reported together, never alone.
+    - negative controls: their speedup must be ~1.0; deviation means the
+      cache fired (or slowed things) on unrelated content.
+    """
     cold = {r.item_id: r for r in requests if r.arm == "cold"}
     warm = {r.item_id: r for r in requests if r.arm == "warm"}
     if not cold or not warm:
@@ -135,7 +156,12 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     from sembench.stats import bootstrap_mean
 
     speedups: list[float] = []
+    hit_speedups: list[float] = []
+    negative_speedups: list[float] = []
+    cold_ttfts: list[float] = []
+    warm_ttfts: list[float] = []
     output_rouge: list[float] = []
+    hits = 0
     contaminated = 0
     errored = 0
     for item_id, cold_row in cold.items():
@@ -149,20 +175,43 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
             errored += 1
             continue
         if cold_row.ttft_ms and warm_row.ttft_ms:
-            speedups.append(cold_row.ttft_ms / warm_row.ttft_ms)
+            ratio = cold_row.ttft_ms / warm_row.ttft_ms
+            cold_ttfts.append(cold_row.ttft_ms)
+            warm_ttfts.append(warm_row.ttft_ms)
+            if cold_row.negative_control:
+                negative_speedups.append(ratio)
+            else:
+                speedups.append(ratio)
+                warm_hit = bool(warm_row.backend_confirmed_tokens)
+                if warm_hit:
+                    hits += 1
+                    hit_speedups.append(ratio)
         if cold_row.output_text and warm_row.output_text:
             output_rouge.append(rouge_l(warm_row.output_text, cold_row.output_text))
     speedup_ci = bootstrap_mean(speedups)
+    hit_ci = bootstrap_mean(hit_speedups)
+    negative_ci = bootstrap_mean(negative_speedups)
     rouge_ci = bootstrap_mean(output_rouge)
     return {
         "pairs_total": len(cold),
-        "pairs_used": len(speedups),
+        "pairs_used": len(speedups) + len(negative_speedups),
         "pairs_contaminated": contaminated,
         "pairs_errored": errored,
-        "ttft_speedup_mean": speedup_ci.point if speedup_ci else None,
-        "ttft_speedup_ci": speedup_ci.to_dict() if speedup_ci else None,
+        "ttft_cold_p50_ms": _pctl(cold_ttfts, 50),
+        "ttft_cold_p95_ms": _pctl(cold_ttfts, 95),
+        "ttft_warm_p50_ms": _pctl(warm_ttfts, 50),
+        "ttft_warm_p95_ms": _pctl(warm_ttfts, 95),
+        "blended_ttft_speedup_mean": speedup_ci.point if speedup_ci else None,
+        "blended_ttft_speedup_ci": speedup_ci.to_dict() if speedup_ci else None,
+        "hit_rate": (hits / len(speedups)) if speedups else None,
+        "hit_only_ttft_speedup_mean": hit_ci.point if hit_ci else None,
+        "hit_only_ttft_speedup_ci": hit_ci.to_dict() if hit_ci else None,
+        "negative_control_pairs": len(negative_speedups),
+        "negative_control_ttft_speedup_mean": negative_ci.point if negative_ci else None,
         "warm_vs_cold_output_rouge_l_mean": rouge_ci.point if rouge_ci else None,
         "warm_vs_cold_output_rouge_l_ci": rouge_ci.to_dict() if rouge_ci else None,
+        # Back-compat alias for the pre-P3 field name.
+        "ttft_speedup_mean": speedup_ci.point if speedup_ci else None,
     }
 
 

@@ -119,3 +119,27 @@ def test_single_mode_unchanged_shape():
     assert [r.arm for r in rows] == ["single"]
     assert rows[0].flush_contaminated is None
     assert paired_summary(rows) is None
+
+
+def test_negative_control_pairs_tracked_separately():
+    neg = WorkloadItem(
+        item_id="neg1",
+        dataset="t",
+        source_id="s2",
+        transform="negative_control",
+        donor_prompts=[DonorPrompt(donor_id="d", text="DONOR unrelated " * 12, label="u")],
+        recipient_prompt="unrelated recipient " * 12,
+        negative_control=True,
+    )
+    rows = _run(_config(paired=True), FakeTransport(), items=[_item(), neg])
+    summary = paired_summary(rows)
+    assert summary["negative_control_pairs"] == 1
+    # regular pair: 200/40 = 5.0 blended; hit (cached_tokens 48 > 0) → hit_rate 1.0
+    assert summary["blended_ttft_speedup_mean"] == 5.0
+    assert summary["hit_rate"] == 1.0
+    assert summary["hit_only_ttft_speedup_mean"] == 5.0
+    # FakeTransport warms every seeded recipient, so the neg control also
+    # speeds up — exactly what the deviation gate exists to catch.
+    assert summary["negative_control_ttft_speedup_mean"] == 5.0
+    assert summary["ttft_cold_p50_ms"] == 200.0
+    assert summary["ttft_warm_p50_ms"] == 40.0

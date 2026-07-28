@@ -110,3 +110,23 @@ negative_control_semantic_eligible_rate
 ```
 
 This should remain near zero before interpreting positive lift as useful.
+
+## TTFT contract (paired runs)
+
+The `paired` result block is the TTFT source of truth; single-arm
+`mean_ttft_ms` is informational only.
+
+- `blended_ttft_speedup_mean` (+CI) — headline. Every clean non-negative
+  pair contributes its real cold/warm ratio; misses naturally contribute
+  ~1.0x. Never report hit-only numbers as the headline.
+- `hit_only_ttft_speedup_mean` (+CI) — reported ONLY alongside `hit_rate`.
+- `ttft_{cold,warm}_p{50,95}_ms` — per-arm percentiles.
+- `negative_control_ttft_speedup_mean` — must sit at ~1.0; deviation means
+  the cache acted on unrelated content (gate:
+  `--max-negative-control-speedup-deviation`).
+- `pairs_contaminated` — cold arms whose engine reported cached tokens;
+  excluded from every aggregate and gateable via
+  `--require-contamination-check`.
+- Quality companion: `warm_vs_cold_output_rouge_l_mean` is judged against a
+  protocol-matched noise-floor artifact (see CALIBRATION.md) — never as an
+  absolute.
