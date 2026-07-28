@@ -281,6 +281,7 @@ def _build_items(
     max_segments: int,
     min_segment_chars: int,
     revision: str | None,
+    negative_selection: str = "cross_domain",
 ):
     if profile == "longbench-v1" and not datasets:
         datasets = list(DEFAULT_LONGBENCH_V1_DATASETS)
@@ -306,6 +307,7 @@ def _build_items(
         transforms=transforms,
         max_segments=max_segments,
         min_segment_chars=min_segment_chars,
+        negative_selection=negative_selection,
     )
     return records, build_workload(records, config)
 
@@ -336,6 +338,7 @@ def cmd_build(args) -> None:
         max_segments = spec.max_segments
         min_segment_chars = spec.min_segment_chars
         revision = spec.hf_revision
+        negative_selection = spec.negative_selection
     else:
         if args.profile is None:
             raise SystemExit("one of --profile or --frozen is required")
@@ -346,6 +349,7 @@ def cmd_build(args) -> None:
         max_segments = args.max_segments
         min_segment_chars = args.min_segment_chars
         revision = args.hf_revision
+        negative_selection = "cross_domain"
 
     records, items = _build_items(
         profile=profile,
@@ -355,6 +359,7 @@ def cmd_build(args) -> None:
         max_segments=max_segments,
         min_segment_chars=min_segment_chars,
         revision=revision,
+        negative_selection=negative_selection,
     )
     write_jsonl(args.output, items)
 
@@ -379,6 +384,7 @@ def _build_frozen_manifest(spec, output_path: Path) -> int:
         max_segments=spec.max_segments,
         min_segment_chars=spec.min_segment_chars,
         revision=spec.hf_revision,
+        negative_selection=spec.negative_selection,
     )
     write_jsonl(output_path, items)
     return len(items)

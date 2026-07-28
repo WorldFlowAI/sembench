@@ -58,6 +58,7 @@ jobs:
         run: |
           python -m sembench verify-frozen --spec fixture-v1
           python -m sembench verify-frozen --spec synthetic-v1
+          python -m sembench verify-frozen --spec synthetic-v2
 
   build:
     runs-on: ubuntu-latest

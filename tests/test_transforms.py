@@ -45,3 +45,67 @@ def test_split_context_is_bounded_and_deterministic():
     assert a == b
     assert 1 <= len(a) <= 3
     assert all(segment for segment in a)
+
+
+def test_cross_domain_negative_selection():
+    from sembench.schema import SourceRecord
+    from sembench.transforms import TransformConfig, build_workload
+
+    records = [
+        SourceRecord(
+            source_id=f"{d}-{i}",
+            dataset="t",
+            context=f"doc {d} {i} " * 50,
+            input="q?",
+            metadata={"domain": d},
+        )
+        for d in ("alpha", "beta")
+        for i in range(3)
+    ]
+    items = build_workload(
+        records,
+        TransformConfig(transforms=("negative_control",), negative_selection="cross_domain"),
+    )
+    for item in items:
+        neg_src = item.metadata["negative_source_id"]
+        home_domain = item.source_id.split("-")[0]
+        assert not neg_src.startswith(home_domain), (item.source_id, neg_src)
+
+
+def test_adjacent_selection_preserved_for_v1():
+    from sembench.schema import SourceRecord
+    from sembench.transforms import TransformConfig, build_workload
+
+    records = [
+        SourceRecord(source_id=f"s{i}", dataset="t", context=f"doc {i} " * 50, input="q?")
+        for i in range(3)
+    ]
+    items = build_workload(
+        records, TransformConfig(transforms=("negative_control",), negative_selection="adjacent")
+    )
+    assert [i.metadata["negative_source_id"] for i in items] == ["s1", "s2", "s0"]
+
+
+def test_entity_swap_control_same_domain_not_negative():
+    from sembench.schema import SourceRecord
+    from sembench.transforms import TransformConfig, build_workload
+
+    records = [
+        SourceRecord(
+            source_id=f"{d}-{i}",
+            dataset="t",
+            context=f"doc {d} {i} " * 50,
+            input="q?",
+            metadata={"domain": d},
+        )
+        for d in ("alpha", "beta")
+        for i in range(2)
+    ]
+    items = build_workload(records, TransformConfig(transforms=("entity_swap_control",)))
+    assert items, "entity swap items should exist for same-domain neighbors"
+    for item in items:
+        assert item.negative_control is False
+        assert item.metadata["entity_swap"] is True
+        swap_src = item.metadata["entity_swap_source_id"]
+        assert swap_src.split("-")[0] == item.source_id.split("-")[0]  # same domain
+        assert swap_src != item.source_id

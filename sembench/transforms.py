@@ -19,6 +19,11 @@ DEFAULT_TRANSFORMS = (
     "negative_control",
 )
 
+# v2 adds the highest-severity quality-risk workload: a SAME-domain donor that
+# is a near-duplicate modulo entities. Reusing its KV without corruption of
+# the recipient's own facts is the hardest honest test for semantic caches.
+TRANSFORMS_V2 = DEFAULT_TRANSFORMS + ("entity_swap_control",)
+
 
 @dataclass(frozen=True)
 class TransformConfig:
@@ -27,6 +32,32 @@ class TransformConfig:
     transforms: tuple[str, ...] = DEFAULT_TRANSFORMS
     max_segments: int = 4
     min_segment_chars: int = 400
+    negative_selection: str = "cross_domain"  # v1 frozen specs pin "adjacent"
+
+
+def _record_domain(record: SourceRecord) -> str:
+    return str(record.metadata.get("domain") or record.dataset)
+
+
+def _pick_negative(records: list[SourceRecord], idx: int, selection: str) -> SourceRecord:
+    """Choose the unrelated donor for negative controls.
+
+    "adjacent" (legacy, pinned by v1 frozen specs) takes the next record —
+    which in a domain-ordered corpus is usually the SAME domain, making the
+    "unrelated" donor a near-duplicate modulo entities (74-79% fuzzy-alignable
+    in practice: an entity-swap pair, not an unrelated one). "cross_domain"
+    takes the first record of a DIFFERENT domain in cyclic order.
+    """
+    n = len(records)
+    if n <= 1:
+        return records[idx]
+    if selection == "cross_domain":
+        home = _record_domain(records[idx])
+        for offset in range(1, n):
+            candidate = records[(idx + offset) % n]
+            if _record_domain(candidate) != home:
+                return candidate
+    return records[(idx + 1) % n]
 
 
 def build_workload(
@@ -37,11 +68,24 @@ def build_workload(
     cfg = config or TransformConfig()
     items: list[WorkloadItem] = []
     for idx, record in enumerate(records):
-        negative = records[(idx + 1) % len(records)] if len(records) > 1 else record
+        negative = _pick_negative(records, idx, cfg.negative_selection)
+        entity_swap = records[(idx + 1) % len(records)] if len(records) > 1 else record
         for transform in cfg.transforms:
             if transform == "negative_control" and negative.source_id == record.source_id:
                 continue
-            items.append(_build_item(record, transform, cfg, negative))
+            if transform == "entity_swap_control" and (
+                entity_swap.source_id == record.source_id
+                or _record_domain(entity_swap) != _record_domain(record)
+            ):
+                continue
+            items.append(
+                _build_item(
+                    record,
+                    transform,
+                    cfg,
+                    negative if transform != "entity_swap_control" else entity_swap,
+                )
+            )
     return items
 
 
@@ -141,6 +185,23 @@ def _build_item(
         recipient = _fuzzy_edit_prompt(record.context, record.input)
         negative = False
         metadata = {"expected_exact": False, "enterprise_shape": "metadata_edit"}
+    elif transform == "entity_swap_control":
+        donor_text = _base_prompt(negative_record.context, negative_record.input)
+        donors = [
+            DonorPrompt(
+                donor_id=donor_id,
+                text=donor_text,
+                label="entity_swap_donor",
+                metadata={"entity_swap_source_id": negative_record.source_id},
+            )
+        ]
+        recipient = base
+        negative = False
+        metadata = {
+            "entity_swap": True,
+            "entity_swap_source_id": negative_record.source_id,
+            "expected_no_fact_leak": True,
+        }
     elif transform == "negative_control":
         donor_text = _base_prompt(negative_record.context, negative_record.input)
         donors = [

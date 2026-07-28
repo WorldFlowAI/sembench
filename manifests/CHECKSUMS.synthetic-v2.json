@@ -1,0 +1,29 @@
+{
+  "manifest": "synthetic-v2.jsonl",
+  "sha256": "4eac45b53269a3502c961f3bf11bc6629ab3dba8274e5bfba4005fd14e7cb6cd",
+  "spec": {
+    "datasets": [
+      "synthetic-enterprise-v1"
+    ],
+    "hf_revision": null,
+    "max_items_per_dataset": 80,
+    "max_segments": 4,
+    "min_segment_chars": 400,
+    "name": "synthetic-v2",
+    "negative_selection": "cross_domain",
+    "profile": "synthetic-v1",
+    "tokenizer": "Qwen/Qwen2.5-7B-Instruct",
+    "transforms": [
+      "exact_repeat",
+      "instruction_variant",
+      "same_evidence_new_task",
+      "leading_evidence_new_task",
+      "rag_reorder",
+      "multi_donor_composite",
+      "fuzzy_edit",
+      "negative_control",
+      "entity_swap_control"
+    ]
+  },
+  "workload_items": 2157
+}

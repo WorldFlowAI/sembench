@@ -94,7 +94,11 @@ def audit_manifest_items(
     for item in items:
         own = own_donor_hashes.setdefault(item.item_id, set())
         for donor in item.donor_prompts:
-            origin = str(donor.metadata.get("negative_source_id") or item.source_id)
+            origin = str(
+                donor.metadata.get("negative_source_id")
+                or donor.metadata.get("entity_swap_source_id")
+                or item.source_id
+            )
             for block in iter_full_blocks(tokenizer.encode(donor.text), block_size):
                 donor_blocks += 1
                 if is_degenerate_block(block):
