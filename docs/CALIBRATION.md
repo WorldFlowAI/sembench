@@ -50,3 +50,24 @@ is real, but it belongs to a different protocol.
 - Measure and publish the CONCURRENT floor (production-realistic) as a second
   artifact class; benchmark reports should state which floor applies.
 - Second model family (Llama-3.1-8B) floors in the defensibility phase.
+
+## Findings from EXP-0002 (2026-07-28, first fuzzy-backend campaign)
+
+1. **Partial exact-prefix hits are not output-invariant.** With the stock
+   radix cache, warm arms whose recipients got PARTIAL prefix hits diverged
+   from their cold runs in 8/12 cases (first divergence ≈ token 34), while
+   all 48 pairs with no cache hit were byte-identical — and full-prefix hits
+   (EXP-0001) were byte-identical too. Chunked-prefill boundary numerics
+   differ when prefill starts from a cached partial prefix. Consequence:
+   even "lossless" exact caching perturbs outputs under partial hits; paired
+   quality comparisons must not attribute that divergence to a semantic
+   mechanism. sembench's contamination flag + per-pair cache accounting make
+   the attribution explicit.
+
+2. **Async donor registration needs a settle window.** Engines that register
+   donors asynchronously (e.g. the SGLang fuzzy backend embeds off the hot
+   path) have a window where an immediately-following query finds no donor.
+   Benchmark protocol: set `--post-donor-delay-ms` (12s was sufficient for
+   17k-token donors on A10G) or the engine must expose a
+   registration-complete signal. A run reporting zero semantic activity
+   without controlling for this measures the race, not the mechanism.
