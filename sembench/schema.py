@@ -115,6 +115,8 @@ class RequestMetrics:
     quality_rouge_l: float | None = None
     arm: str = "single"
     flush_contaminated: bool | None = None
+    output_token_ids: list[int] | None = None
+    output_top_logprobs: list[list[tuple[int, float]]] | None = None
     error: str | None = None
 
     def to_dict(self) -> dict[str, Any]:

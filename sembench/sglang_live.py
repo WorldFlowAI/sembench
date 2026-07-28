@@ -34,6 +34,8 @@ class LiveSglangConfig:
     paired: bool = False
     warmup_requests: int = 0
     cooldown_ms: int = 0
+    capture_logprobs: bool = False
+    top_logprobs_num: int = 8
 
 
 async def run_live_sglang(config: LiveSglangConfig) -> list[RequestMetrics]:
@@ -51,7 +53,12 @@ async def run_live_sglang(config: LiveSglangConfig) -> list[RequestMetrics]:
     base_url = config.base_url.rstrip("/")
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
-        transport = _HttpTransport(session=session, base_url=base_url)
+        transport = _HttpTransport(
+            session=session,
+            base_url=base_url,
+            capture_logprobs=config.capture_logprobs,
+            top_logprobs_num=config.top_logprobs_num,
+        )
         return await replay_items(
             items=items, transport=transport, config=config, tokenizer=tokenizer
         )
@@ -60,16 +67,25 @@ async def run_live_sglang(config: LiveSglangConfig) -> list[RequestMetrics]:
 class _HttpTransport:
     """Real SGLang transport; tests substitute a fake with the same surface."""
 
-    def __init__(self, *, session, base_url: str) -> None:
+    def __init__(
+        self, *, session, base_url: str, capture_logprobs: bool = False, top_logprobs_num: int = 8
+    ) -> None:
         self._session = session
         self._base_url = base_url
+        self._capture_logprobs = capture_logprobs
+        self._top_logprobs_num = top_logprobs_num
 
     async def flush(self) -> None:
         await _post_json(self._session, f"{self._base_url}/flush_cache", {})
 
     async def generate(self, text: str, max_new_tokens: int) -> dict[str, Any]:
         return await _send_generate(
-            self._session, f"{self._base_url}/generate", text, max_new_tokens
+            self._session,
+            f"{self._base_url}/generate",
+            text,
+            max_new_tokens,
+            capture_logprobs=self._capture_logprobs,
+            top_logprobs_num=self._top_logprobs_num,
         )
 
 
@@ -187,6 +203,8 @@ def _metrics_from_live_item(
         quality_rouge_l=answer_rouge,
         arm=arm,
         flush_contaminated=flush_contaminated,
+        output_token_ids=response.get("output_token_ids"),
+        output_top_logprobs=response.get("output_top_logprobs"),
         error=response.get("error"),
     )
 
@@ -204,6 +222,8 @@ async def _send_generate(
     url: str,
     text: str,
     max_new_tokens: int,
+    capture_logprobs: bool = False,
+    top_logprobs_num: int = 8,
 ) -> dict[str, Any]:
     payload = {
         "text": text,
@@ -215,11 +235,16 @@ async def _send_generate(
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    if capture_logprobs:
+        payload["return_logprob"] = True
+        payload["top_logprobs_num"] = top_logprobs_num
     start = time.perf_counter()
     ttft_ms: float | None = None
     prompt_tokens = 0
     cached_tokens = 0
     output_text = ""
+    output_token_logprobs: list | None = None
+    output_top_logprobs: list | None = None
     error: str | None = None
     try:
         async with session.post(url=url, json=payload) as response:
@@ -247,6 +272,10 @@ async def _send_generate(
                 if meta:
                     prompt_tokens = int(meta.get("prompt_tokens") or prompt_tokens)
                     cached_tokens = int(meta.get("cached_tokens") or cached_tokens)
+                    if meta.get("output_token_logprobs") is not None:
+                        output_token_logprobs = meta["output_token_logprobs"]
+                    if meta.get("output_top_logprobs") is not None:
+                        output_top_logprobs = meta["output_top_logprobs"]
                 if data.get("output_ids") and ttft_ms is None:
                     ttft_ms = (time.perf_counter() - start) * 1000
                 usage = data.get("usage") or {}
@@ -256,7 +285,7 @@ async def _send_generate(
                     cached_tokens = int(details.get("cached_tokens") or cached_tokens)
     except Exception as e:
         error = f"{type(e).__name__}: {e}"
-    return {
+    result: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
         "ttft_ms": ttft_ms,
@@ -264,6 +293,16 @@ async def _send_generate(
         "output_text": output_text,
         "error": error,
     }
+    if output_token_logprobs is not None:
+        # sglang entries are [logprob, token_id, text]; keep chosen ids.
+        result["output_token_ids"] = [int(entry[1]) for entry in output_token_logprobs]
+    if output_top_logprobs is not None:
+        # per position: list of [logprob, token_id, text] → (token_id, logprob)
+        result["output_top_logprobs"] = [
+            [(int(entry[1]), float(entry[0])) for entry in position]
+            for position in output_top_logprobs
+        ]
+    return result
 
 
 def run_live_sglang_sync(config: LiveSglangConfig) -> list[RequestMetrics]:

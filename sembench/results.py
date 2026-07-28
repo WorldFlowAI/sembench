@@ -188,10 +188,36 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
                     hit_speedups.append(ratio)
         if cold_row.output_text and warm_row.output_text:
             output_rouge.append(rouge_l(warm_row.output_text, cold_row.output_text))
+    kl_means: list[float] = []
+    first_divergences: list[int] = []
+    for item_id, cold_row in cold.items():
+        warm_row = warm.get(item_id)
+        if (
+            warm_row is None
+            or cold_row.flush_contaminated
+            or cold_row.error
+            or warm_row.error
+            or not cold_row.output_top_logprobs
+            or not warm_row.output_top_logprobs
+        ):
+            continue
+        from sembench.kl import kl_profile
+
+        profile = kl_profile(
+            cold_row.output_token_ids or [],
+            [[tuple(entry) for entry in pos] for pos in cold_row.output_top_logprobs],
+            warm_row.output_token_ids or [],
+            [[tuple(entry) for entry in pos] for pos in warm_row.output_top_logprobs],
+        )
+        kl_means.append(profile.mean_kl_topk)
+        if profile.first_token_divergence is not None:
+            first_divergences.append(profile.first_token_divergence)
+
     speedup_ci = bootstrap_mean(speedups)
     hit_ci = bootstrap_mean(hit_speedups)
     negative_ci = bootstrap_mean(negative_speedups)
     rouge_ci = bootstrap_mean(output_rouge)
+    kl_ci = bootstrap_mean(kl_means)
     return {
         "pairs_total": len(cold),
         "pairs_used": len(speedups) + len(negative_speedups),
@@ -210,6 +236,12 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
         "negative_control_ttft_speedup_mean": negative_ci.point if negative_ci else None,
         "warm_vs_cold_output_rouge_l_mean": rouge_ci.point if rouge_ci else None,
         "warm_vs_cold_output_rouge_l_ci": rouge_ci.to_dict() if rouge_ci else None,
+        "warm_vs_cold_mean_kl_topk": kl_ci.point if kl_ci else None,
+        "warm_vs_cold_mean_kl_topk_ci": kl_ci.to_dict() if kl_ci else None,
+        "kl_pairs": len(kl_means),
+        "first_token_divergence_median": (
+            sorted(first_divergences)[len(first_divergences) // 2] if first_divergences else None
+        ),
         # Back-compat alias for the pre-P3 field name.
         "ttft_speedup_mean": speedup_ci.point if speedup_ci else None,
     }
