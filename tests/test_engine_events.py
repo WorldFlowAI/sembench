@@ -179,3 +179,37 @@ INFO 07-28 lmcache.integration: Retrieved 0 / 4096 tokens for request r2
 
         summary = parse_engine_events("lmcache", "ERROR something broke\n")
         assert summary.errors
+
+
+class TestLmcacheNightlyFormats:
+    """Verbatim log shapes from LMCache source @ c777274 (nightly, 2026-07).
+
+    Sources: lmcache/integration/vllm/vllm_v1_adapter.py (Retrieved,
+    Reqid-lookup lines), lmcache/v1/cache_engine.py (Stored lines).
+    """
+
+    LOGS = "\n".join(
+        [
+            "INFO 07-29 lmcache: Retrieved 4096 tokens",
+            "INFO 07-29 lmcache: [req_id=r1] Stored 8192 out of total 8192 tokens. "
+            "size: 0.5000 GB, cost 12.0000 ms, throughput: 41.0000 GB/s",
+            "INFO 07-29 lmcache: Reqid: r2, Total tokens 8192, "
+            "Inference Engine computed tokens: 4096, "
+            "LMCache hit tokens: 2048, need to load: 2048",
+        ]
+    )
+
+    def test_nightly_retrieve_and_store_parse(self):
+        summary = parse_engine_events("lmcache", self.LOGS)
+        assert summary.materialization_events == 1
+        assert summary.materialized_tokens == 4096
+        assert summary.donor_registrations == 1
+        assert summary.events["stored"][0]["tokens"] == "8192"
+        assert summary.events["stored"][0]["total"] == "8192"
+
+    def test_nightly_hit_line_carries_marginal_split(self):
+        summary = parse_engine_events("lmcache", self.LOGS)
+        hit = summary.events["hits"][0]
+        assert hit["tokens"] == "2048"  # LMCache's ADDITIONAL reuse
+        assert hit["computed"] == "4096"  # engine's own prefix coverage
+        assert hit["total"] == "8192"

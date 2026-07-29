@@ -69,15 +69,25 @@ SGLANG_SEGMENTED_PHASE_RE = re.compile(
 # stays 0 by definition, so `materialized_semantic_kv_reuse` is False for
 # LMCache rows — the flag means what it says.
 LMCACHE_RETRIEVE_RE = re.compile(
-    r"(?:Retrieved|Reusing)\s+(?P<tokens>\d+)\s*(?:/|out of)\s*(?P<total>\d+)",
+    r"(?:Retrieved|Reusing)\s+(?P<tokens>\d+)"
+    r"(?:\s*(?:/|out of(?: total)?)\s*(?P<total>\d+))?\s*tokens",
     re.IGNORECASE,
 )
 LMCACHE_STORE_RE = re.compile(
-    r"Stor(?:ed|ing)\s+(?P<tokens>\d+)\s+(?:new\s+)?tokens",
+    r"Stor(?:ed|ing)\s+(?P<tokens>\d+)"
+    r"(?:\s+out of total\s+(?P<total>\d+))?\s+(?:new\s+)?tokens",
     re.IGNORECASE,
 )
+# Current adapter lookup line carries the exact-vs-marginal split in one place:
+# "Reqid: r1, Total tokens 8192, Inference Engine computed tokens: 4096,
+#  LMCache hit tokens: 2048, need to load: 2048"
+# `computed` = the serving engine's own prefix-cache coverage; `tokens` = the
+# ADDITIONAL reuse LMCache supplies on top — the marginal-reuse split.
 LMCACHE_HIT_RE = re.compile(
-    r"(?:cache\s+hit|lookup\s+hit).*?tokens[=:\s]+(?P<tokens>\d+)",
+    r"(?:Total tokens\s+(?P<total>\d+),\s*"
+    r"Inference Engine computed tokens:\s*(?P<computed>\d+),\s*)?"
+    r"(?:LMCache\s+(?:cache\s+)?hit|cache\s+hit|lookup\s+hit).*?"
+    r"tokens[=:\s]+(?P<tokens>\d+)",
     re.IGNORECASE,
 )
 RUNTIME_WARNING_MARKERS = (
