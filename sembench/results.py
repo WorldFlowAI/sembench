@@ -135,6 +135,28 @@ def _pctl(values: list[float], pct: float) -> float | None:
     return ordered[low] * (1 - frac) + ordered[high] * frac
 
 
+# A warm arm counts as a HIT only at >= this many engine-confirmed reuse
+# tokens (max of prefix-path cached and fuzzy-admitted mass). Single-digit
+# "hits" (e.g. a 3-token shared literal prefix) are numeric noise, not reuse.
+REUSE_HIT_THRESHOLD_TOKENS = 64
+
+
+def reuse_mechanism(row: RequestMetrics) -> str:
+    """Classify HOW a warm arm reused: 'scatter' (fuzzy mass beyond the
+    prefix path), 'head' (fuzzy folded into the prefix), 'exact' (prefix
+    cache only), or 'none'. Mechanisms damage quality differently
+    (attention-sink positions vs mid-sequence) — never pool them."""
+    fuzzy = row.fuzzy_confirmed_tokens or 0
+    cached = row.backend_confirmed_tokens or 0
+    if fuzzy > cached:
+        return "scatter"
+    if fuzzy > 0:
+        return "head"
+    if cached >= REUSE_HIT_THRESHOLD_TOKENS:
+        return "exact"
+    return "none"
+
+
 def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     """Per-item cold/warm pairing: TTFT speedups and warm-vs-cold output
     similarity. Pairs with a contaminated cold arm are excluded and counted.
@@ -164,6 +186,9 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     hits = 0
     contaminated = 0
     errored = 0
+    from collections import Counter
+
+    mechanisms: Counter[str] = Counter()
     for item_id, cold_row in cold.items():
         warm_row = warm.get(item_id)
         if warm_row is None:
@@ -182,10 +207,15 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
                 negative_speedups.append(ratio)
             else:
                 speedups.append(ratio)
-                warm_hit = bool(warm_row.backend_confirmed_tokens)
+                reuse_tokens = max(
+                    warm_row.backend_confirmed_tokens or 0,
+                    warm_row.fuzzy_confirmed_tokens or 0,
+                )
+                warm_hit = reuse_tokens >= REUSE_HIT_THRESHOLD_TOKENS
                 if warm_hit:
                     hits += 1
                     hit_speedups.append(ratio)
+                mechanisms[reuse_mechanism(warm_row)] += 1
         if cold_row.output_text and warm_row.output_text:
             output_rouge.append(rouge_l(warm_row.output_text, cold_row.output_text))
     kl_means: list[float] = []
@@ -219,6 +249,11 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     rouge_ci = bootstrap_mean(output_rouge)
     kl_ci = bootstrap_mean(kl_means)
     return {
+        "hit_definition": f">={REUSE_HIT_THRESHOLD_TOKENS} engine-confirmed reuse tokens",
+        "reuse_mechanisms": dict(mechanisms),
+        "fuzzy_confirmed_tokens_warm": [
+            w.fuzzy_confirmed_tokens or 0 for w in warm.values()
+        ],
         "pairs_total": len(cold),
         "pairs_used": len(speedups) + len(negative_speedups),
         "pairs_contaminated": contaminated,

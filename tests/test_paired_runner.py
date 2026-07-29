@@ -35,7 +35,7 @@ class FakeTransport:
         if self._seeded:
             return {
                 "prompt_tokens": 64,
-                "cached_tokens": 48,
+                "cached_tokens": 96,
                 "ttft_ms": 40.0,
                 "latency_ms": 60.0,
                 "output_text": "the answer is 42 minutes",
@@ -139,7 +139,8 @@ def test_negative_control_pairs_tracked_separately():
     rows = _run(_config(paired=True), FakeTransport(), items=[_item(), neg])
     summary = paired_summary(rows)
     assert summary["negative_control_pairs"] == 1
-    # regular pair: 200/40 = 5.0 blended; hit (cached_tokens 48 > 0) → hit_rate 1.0
+    # regular pair: 200/40 = 5.0 blended; hit (cached_tokens 96 >= 64-token
+    # reuse threshold) → hit_rate 1.0
     assert summary["blended_ttft_speedup_mean"] == 5.0
     assert summary["hit_rate"] == 1.0
     assert summary["hit_only_ttft_speedup_mean"] == 5.0

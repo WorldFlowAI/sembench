@@ -94,6 +94,10 @@ class RequestMetrics:
     semantic_eligible_tokens: int
     backend_confirmed_blocks: int | None = None
     backend_confirmed_tokens: int | None = None
+    # Engine-reported fuzzy-admitted mass (cached_tokens_details["fuzzy"]).
+    # On sglang's contiguous path this is a subset of backend_confirmed_tokens;
+    # on the segments path it is scatter mass NOT counted there.
+    fuzzy_confirmed_tokens: int = 0
     semblend_found: bool = False
     semblend_similarity: float = 0.0
     semblend_reuse_ratio: float = 0.0

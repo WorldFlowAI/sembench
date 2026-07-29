@@ -249,6 +249,7 @@ def _metrics_from_live_item(
         semantic_eligible_tokens=0,
         backend_confirmed_blocks=confirmed_blocks,
         backend_confirmed_tokens=cached_tokens,
+        fuzzy_confirmed_tokens=int(response.get("fuzzy_tokens") or 0),
         ttft_ms=response.get("ttft_ms"),
         latency_ms=response.get("latency_ms"),
         output_text=output_text[:2000],
@@ -297,6 +298,7 @@ async def _send_generate(
     ttft_ms: float | None = None
     prompt_tokens = 0
     cached_tokens = 0
+    fuzzy_tokens = 0
     output_text = ""
     output_token_logprobs: list | None = None
     output_top_logprobs: list | None = None
@@ -327,6 +329,8 @@ async def _send_generate(
                 if meta:
                     prompt_tokens = int(meta.get("prompt_tokens") or prompt_tokens)
                     cached_tokens = int(meta.get("cached_tokens") or cached_tokens)
+                    details = meta.get("cached_tokens_details") or {}
+                    fuzzy_tokens = int(details.get("fuzzy") or fuzzy_tokens)
                     if meta.get("output_token_logprobs") is not None:
                         output_token_logprobs = meta["output_token_logprobs"]
                     if meta.get("output_top_logprobs") is not None:
@@ -343,6 +347,7 @@ async def _send_generate(
     result: dict[str, Any] = {
         "prompt_tokens": prompt_tokens,
         "cached_tokens": cached_tokens,
+        "fuzzy_tokens": fuzzy_tokens,
         "ttft_ms": ttft_ms,
         "latency_ms": (time.perf_counter() - start) * 1000,
         "output_text": output_text,
