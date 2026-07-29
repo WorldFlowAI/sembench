@@ -177,6 +177,14 @@ def parse_lmcache_logs(logs: str) -> EngineReuseSummary:
 
 
 def parse_vllm_logs(logs: str) -> EngineReuseSummary:
+    """Semantic reuse evidence from semblend-vllm-connector serving logs.
+
+    Source-validated against semblend_vllm_connector/connector.py @ 01ad2a3:
+    every matched line is emitted ONLY when the connector runs with
+    ``log_decisions=True`` — a run without it parses as zero reuse. Runners
+    must enable it and treat an all-zero summary with nonzero requests as a
+    configuration failure, not a miss.
+    """
     events: dict[str, list[dict[str, Any]]] = {
         "donor_registered": [],
         "semantic_hits": [],
