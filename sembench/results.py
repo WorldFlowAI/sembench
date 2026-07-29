@@ -251,9 +251,7 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     return {
         "hit_definition": f">={REUSE_HIT_THRESHOLD_TOKENS} engine-confirmed reuse tokens",
         "reuse_mechanisms": dict(mechanisms),
-        "fuzzy_confirmed_tokens_warm": [
-            w.fuzzy_confirmed_tokens or 0 for w in warm.values()
-        ],
+        "fuzzy_confirmed_tokens_warm": [w.fuzzy_confirmed_tokens or 0 for w in warm.values()],
         "pairs_total": len(cold),
         "pairs_used": len(speedups) + len(negative_speedups),
         "pairs_contaminated": contaminated,

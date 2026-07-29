@@ -49,6 +49,6 @@ def test_no_sentence_is_shared_across_sources():
     for record in records:
         for sentence in {s.strip() for s in record.context.split(". ") if s.strip()}:
             owner = seen.setdefault(sentence, record.source_id)
-            assert owner == record.source_id, (
-                f"sentence shared by {owner} and {record.source_id}: {sentence[:80]}"
-            )
+            assert (
+                owner == record.source_id
+            ), f"sentence shared by {owner} and {record.source_id}: {sentence[:80]}"
