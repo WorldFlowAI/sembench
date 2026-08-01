@@ -24,6 +24,43 @@ DEFAULT_TRANSFORMS = (
 # the recipient's own facts is the hardest honest test for semantic caches.
 TRANSFORMS_V2 = DEFAULT_TRANSFORMS + ("entity_swap_control",)
 
+# v3 adds the PRODUCTION semantic-hit classes: the same evidence and the same
+# semantic question re-asked under a different session wrapper (verbatim or
+# reworded). Exact-prefix caching misses these (the prompts diverge at
+# position ~0); a semantic cache should capture them near-losslessly — they
+# are the workload where high-mass reuse must be safe, and the contrast class
+# for the adversarial transforms above.
+TRANSFORMS_V3 = TRANSFORMS_V2 + ("repeat_shifted", "question_paraphrase")
+
+# Deterministic, answer-preserving rewordings for the three synthetic domains'
+# question templates. Applied longest-pattern-first; unmatched questions pass
+# through wrapped (still a valid paraphrase-class item via the wrapper).
+_PARAPHRASE_REWRITES = (
+    (
+        "what was the root cause and how long did mitigation take?",
+        "how long did mitigation take, and what root cause was identified?",
+    ),
+    ("and what period does it specify?", "and what time period applies?"),
+    ("Which clause of agreement", "Identify the clause of agreement"),
+    ("What anomalous error code did", "Which anomalous error code did"),
+    ("and how many occurrences were counted?", "and what was the occurrence count?"),
+    (
+        "What was the customer impact and remediation?",
+        "Describe the remediation and the customer impact.",
+    ),
+    (
+        "Which obligations require legal follow-up?",
+        "List the obligations that need legal follow-up.",
+    ),
+)
+
+
+def _paraphrase_request(request: str) -> str:
+    reworded = request
+    for old_pat, new_pat in _PARAPHRASE_REWRITES:
+        reworded = reworded.replace(old_pat, new_pat)
+    return reworded
+
 
 @dataclass(frozen=True)
 class TransformConfig:
@@ -130,7 +167,17 @@ def _build_item(
     item_id = stable_id(record.dataset, record.source_id, transform)
     donor_id = stable_id(item_id, "donor")
 
-    if transform == "exact_repeat":
+    if transform == "repeat_shifted":
+        donors = [DonorPrompt(donor_id=donor_id, text=base, label="base_prompt")]
+        recipient = _shifted_session_prompt(record.context, record.input)
+        negative = False
+        metadata = {"expected_exact": False, "hit_class": "true_repeat"}
+    elif transform == "question_paraphrase":
+        donors = [DonorPrompt(donor_id=donor_id, text=base, label="base_prompt")]
+        recipient = _shifted_session_prompt(record.context, _paraphrase_request(record.input))
+        negative = False
+        metadata = {"expected_exact": False, "hit_class": "paraphrase"}
+    elif transform == "exact_repeat":
         donors = [DonorPrompt(donor_id=donor_id, text=base, label="base_prompt")]
         recipient = base
         negative = False
@@ -232,6 +279,22 @@ def _build_item(
         answers=record.answers,
         negative_control=negative,
         metadata={**record.metadata, **metadata},
+    )
+
+
+def _shifted_session_prompt(context: str, request: str) -> str:
+    """Same evidence + request as _base_prompt behind a different session
+    wrapper: prompts diverge at position ~0 (exact-prefix misses) while the
+    semantic content is unchanged — the canonical semantic-cache hit."""
+    return (
+        "Support session follow-up (ref: knowledge-workspace)\n\n"
+        "A teammate previously reviewed this material; answer the request "
+        "using the same source, grounded and concise.\n\n"
+        "Source material:\n"
+        f"{context.strip()}\n\n"
+        "User request:\n"
+        f"{request.strip()}\n\n"
+        "Answer:"
     )
 
 
