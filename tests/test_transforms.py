@@ -109,3 +109,23 @@ def test_entity_swap_control_same_domain_not_negative():
         swap_src = item.metadata["entity_swap_source_id"]
         assert swap_src.split("-")[0] == item.source_id.split("-")[0]  # same domain
         assert swap_src != item.source_id
+
+
+def test_sparse_edit_preserves_whitespace_and_most_content():
+    from sembench.transforms import _sparse_edit_prompt
+
+    ctx = ". ".join(f"Sentence number {i} holds fact f{i}" for i in range(200)) + "."
+    out = _sparse_edit_prompt(ctx, "What is fact f5?", "src-1", edit_rate=0.04)
+    out2 = _sparse_edit_prompt(ctx, "What is fact f5?", "src-1", edit_rate=0.04)
+    assert out == out2  # deterministic per source
+    # Most sentences byte-identical inside the body
+    edited = out.count("(rev-2 annotation")
+    assert 2 <= edited <= 20  # ~4% of 200 with binomial spread
+    # No global whitespace reformatting: original spacing survives
+    assert "Sentence number 42 holds fact f42" in out
+
+
+def test_sparse_edit_in_transform_registry():
+    from sembench.transforms import TRANSFORMS_V4
+
+    assert "sparse_edit" in TRANSFORMS_V4

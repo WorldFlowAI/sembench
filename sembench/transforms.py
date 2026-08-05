@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import random
 import re
 from dataclasses import dataclass
 
@@ -31,6 +32,11 @@ TRANSFORMS_V2 = DEFAULT_TRANSFORMS + ("entity_swap_control",)
 # are the workload where high-mass reuse must be safe, and the contrast class
 # for the adversarial transforms above.
 TRANSFORMS_V3 = TRANSFORMS_V2 + ("repeat_shifted", "question_paraphrase")
+
+# v4 adds the doc-v2 class: sparse real content edits at a parameterized
+# per-sentence rate with whitespace PRESERVED (fuzzy_edit, by contrast,
+# reformats whitespace globally and therefore retokenizes every chunk).
+TRANSFORMS_V4 = TRANSFORMS_V3 + ("sparse_edit",)
 
 # Deterministic, answer-preserving rewordings for the three synthetic domains'
 # question templates. Applied longest-pattern-first; unmatched questions pass
@@ -232,6 +238,14 @@ def _build_item(
         recipient = _fuzzy_edit_prompt(record.context, record.input)
         negative = False
         metadata = {"expected_exact": False, "enterprise_shape": "metadata_edit"}
+    elif transform == "sparse_edit":
+        donors = [DonorPrompt(donor_id=donor_id, text=base, label="base_prompt")]
+        recipient = _sparse_edit_prompt(record.context, record.input, record.source_id)
+        negative = False
+        metadata = {
+            "expected_exact": False,
+            "enterprise_shape": "doc_v2_sparse_edit",
+        }
     elif transform == "entity_swap_control":
         donor_text = _base_prompt(negative_record.context, negative_record.input)
         donors = [
@@ -380,6 +394,40 @@ def _multi_donor_prompt(segments: list[str], request: str) -> str:
         "Answer:"
     )
     return "\n".join(parts)
+
+
+def _sparse_edit_prompt(
+    context: str,
+    request: str,
+    source_id: str,
+    edit_rate: float = 0.04,
+) -> str:
+    """Doc-v2 class: edit ~edit_rate of sentences IN PLACE, preserving all
+    other bytes (incl. whitespace), under a shifted session wrapper.
+
+    Deterministic per source (string-keyed seed). Edited sentences get a
+    clearly-marked revision suffix so answers stay derivable from the
+    unedited evidence.
+    """
+    import hashlib as _hashlib
+
+    sentences = re.split(r"(?<=\.) ", context)
+    seed = int(_hashlib.sha256(f"sparse-edit:{source_id}".encode()).hexdigest()[:8], 16)
+    rng = random.Random(seed)
+    edited = []
+    for idx, sent in enumerate(sentences):
+        if sent and rng.random() < edit_rate:
+            edited.append(sent.rstrip(".") + " (rev-2 annotation r" + str(idx) + ").")
+        else:
+            edited.append(sent)
+    body = " ".join(edited)
+    return (
+        "SESSION[doc-v2 review] channel=editorial pass=2\n"
+        "Compare-ready evidence copy follows.\n\n"
+        f"{body}\n\n"
+        f"Request: {request.strip()}\n"
+        "Answer:"
+    )
 
 
 def _fuzzy_edit_prompt(context: str, request: str) -> str:
