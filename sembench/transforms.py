@@ -7,6 +7,12 @@ import random
 import re
 from dataclasses import dataclass
 
+from sembench.paraphrase import (
+    block_overlap_ratio,
+    derived_int,
+    inject_sentence,
+    rewrite_preserving_facts,
+)
 from sembench.schema import DonorPrompt, SourceRecord, WorkloadItem
 
 DEFAULT_TRANSFORMS = (
@@ -38,6 +44,46 @@ TRANSFORMS_V3 = TRANSFORMS_V2 + ("repeat_shifted", "question_paraphrase")
 # reformats whitespace globally and therefore retokenizes every chunk).
 TRANSFORMS_V4 = TRANSFORMS_V3 + ("sparse_edit",)
 
+# v5 adds the verified-paraphrase family: the DOCUMENT BODY is rewritten
+# (token-different, facts preserved), so token-identity verification cannot
+# apply and acceptance requires meaning-level verification. Each accept
+# class ships with its matched leak control (same construction, one digit
+# changed on the donor side) so quality scoring can catch a wrongly served
+# donor by the answer alone. The two restatement classes state a fact in a
+# value-equivalent but digit-disjoint form; verifiers are expected to
+# reject them today, and the benchmark records the accept rate so future
+# meaning tiers show up as measured progress rather than a claim.
+TRANSFORMS_V5 = TRANSFORMS_V4 + (
+    "fact_paraphrase",
+    "fact_divergent_paraphrase",
+    "arithmetic_restatement",
+    "complement_restatement",
+)
+
+_FACT_DONOR = (
+    "The oversight committee's final tally recorded exactly {n} approvals during this period."
+)
+_FACT_RECIPIENT = (
+    "Across this period, precisely {n} approvals appeared in the final "
+    "tally kept by the oversight committee."
+)
+_FACT_QUESTION = (
+    "According to the passage, exactly how many approvals did the oversight "
+    "committee record? Answer with the number only."
+)
+_ARITH_DONOR = (
+    "The oversight committee logged {a} approvals before the midpoint "
+    "review and {b} further approvals afterward."
+)
+_COMPLEMENT_DONOR = "Of the {total} audit review items, exactly {passed} items passed inspection."
+_COMPLEMENT_RECIPIENT = (
+    "Of the {total} audit review items, exactly {failed} items failed inspection."
+)
+_COMPLEMENT_QUESTION = (
+    "According to the passage, exactly how many audit review items failed "
+    "inspection? Answer with the number only."
+)
+
 # Deterministic, answer-preserving rewordings for the three synthetic domains'
 # question templates. Applied longest-pattern-first; unmatched questions pass
 # through wrapped (still a valid paraphrase-class item via the wrapper).
@@ -59,6 +105,194 @@ _PARAPHRASE_REWRITES = (
         "List the obligations that need legal follow-up.",
     ),
 )
+
+
+# Residual verbatim word-block overlap allowed between a source and its
+# rewrite. Above this the identity-verified paths could serve the span and
+# the paraphrase-class premise is void, so building the item fails loudly.
+_MAX_RESIDUAL_OVERLAP = 0.35
+
+_PROBE_SALTS = 64
+
+
+def _fact_probe_numbers(source_id: str, context: str) -> tuple[int, int]:
+    """Probe number plus its divergent twin. The twin always starts with a
+    different leading digit so first-token answer scoring can never collide,
+    and both values are rejection-sampled against the source text: a probe
+    that already occurs anywhere in the context blinds the leak control."""
+    for salt in range(_PROBE_SALTS):
+        n = derived_int(f"fact-n:{source_id}:{salt}", 23, 89)
+        wrong = n + 10 + derived_int(f"fact-wrong:{source_id}:{salt}", 0, 9)
+        while str(wrong)[0] == str(n)[0]:
+            wrong += 10
+        if str(n) not in context and str(wrong) not in context:
+            return n, wrong
+    raise ValueError(f"no collision-free fact probe for {source_id}")
+
+
+def _restated_parts(source_id: str, context: str, n: int) -> tuple[int, int]:
+    """Two distinct addends of n (requires n >= 22), neither present in the
+    source text."""
+    for salt in range(_PROBE_SALTS):
+        part = derived_int(f"fact-part:{source_id}:{salt}", 11, n - 11)
+        other = n - part
+        if part != other and str(part) not in context and str(other) not in context:
+            return part, other
+    raise ValueError(f"no collision-free restated parts for {source_id}")
+
+
+def _complement_numbers(source_id: str, context: str) -> tuple[int, int]:
+    """(total, failed) with passed = total - failed. Same discipline as the
+    fact probes: failed and passed always start with different leading
+    digits, and none of the three values occur in the source text."""
+    for salt in range(_PROBE_SALTS):
+        total = derived_int(f"fact-total:{source_id}:{salt}", 60, 95)
+        failed = derived_int(f"fact-failed:{source_id}:{salt}", 21, 39)
+        passed = total - failed
+        if (
+            failed != passed
+            and str(failed)[0] != str(passed)[0]
+            and str(total) not in context
+            and str(failed) not in context
+            and str(passed) not in context
+        ):
+            return total, failed
+    raise ValueError(f"no collision-free complement numbers for {source_id}")
+
+
+def _v5_probe_pair(
+    record: SourceRecord,
+    donor_id: str,
+    donor_fact: str,
+    recipient_fact: str,
+    question: str,
+    donor_label: str,
+) -> tuple[list[DonorPrompt], str]:
+    """Shared assembly for the v5 classes: donor carries the source text
+    plus its fact sentence; the recipient carries the fact-preserving
+    rewrite plus the restated fact, under the same wrapper so the shared
+    header is the only verbatim anchor. A rewrite that stays too close to
+    the source voids the class premise and fails the build loudly."""
+    rewritten = rewrite_preserving_facts(record.context, seed_key=record.source_id)
+    if block_overlap_ratio(record.context, rewritten) > _MAX_RESIDUAL_OVERLAP:
+        raise ValueError(f"{record.source_id}: rewrite too shallow for a paraphrase-class item")
+    donors = [
+        DonorPrompt(
+            donor_id=donor_id,
+            text=_base_prompt(inject_sentence(record.context, donor_fact), record.input),
+            label=donor_label,
+        )
+    ]
+    recipient = _base_prompt(inject_sentence(rewritten, recipient_fact), question)
+    return donors, recipient
+
+
+def _build_v5_probe_item(
+    *,
+    record: SourceRecord,
+    transform: str,
+    donor_id: str,
+) -> tuple[list[DonorPrompt], str, str, list[str], dict]:
+    # Collision haystack covers everything that lands in either prompt:
+    # a probe value occurring in the question would blind the leak control
+    # exactly like one in the context.
+    context = record.context + "\x1f" + record.input
+    if transform == "fact_paraphrase":
+        n, _ = _fact_probe_numbers(record.source_id, context)
+        donors, recipient = _v5_probe_pair(
+            record,
+            donor_id,
+            _FACT_DONOR.format(n=n),
+            _FACT_RECIPIENT.format(n=n),
+            _FACT_QUESTION,
+            "fact_probe_donor",
+        )
+        return (
+            donors,
+            recipient,
+            _FACT_QUESTION,
+            [str(n)],
+            {
+                "expected_exact": False,
+                "hit_class": "fact_paraphrase",
+                "expected_verifier_accept": True,
+                "fact_probe": n,
+            },
+        )
+    if transform == "fact_divergent_paraphrase":
+        n, wrong = _fact_probe_numbers(record.source_id, context)
+        donors, recipient = _v5_probe_pair(
+            record,
+            donor_id,
+            _FACT_DONOR.format(n=wrong),
+            _FACT_RECIPIENT.format(n=n),
+            _FACT_QUESTION,
+            "fact_divergent_donor",
+        )
+        return (
+            donors,
+            recipient,
+            _FACT_QUESTION,
+            [str(n)],
+            {
+                "expected_exact": False,
+                "hit_class": "fact_divergent_paraphrase",
+                "expected_verifier_accept": False,
+                "expected_no_fact_leak": True,
+                "fact_probe": n,
+                "divergent_donor_value": wrong,
+            },
+        )
+    if transform == "arithmetic_restatement":
+        n, _ = _fact_probe_numbers(record.source_id, context)
+        part, other = _restated_parts(record.source_id, context, n)
+        donors, recipient = _v5_probe_pair(
+            record,
+            donor_id,
+            _ARITH_DONOR.format(a=part, b=other),
+            _FACT_RECIPIENT.format(n=n),
+            _FACT_QUESTION,
+            "arithmetic_restatement_donor",
+        )
+        return (
+            donors,
+            recipient,
+            _FACT_QUESTION,
+            [str(n)],
+            {
+                "expected_exact": False,
+                "hit_class": "arithmetic_restatement",
+                "expected_verifier_accept": False,
+                "fact_equivalent": True,
+                "fact_probe": n,
+                "restated_parts": [part, other],
+            },
+        )
+    if transform == "complement_restatement":
+        total, failed = _complement_numbers(record.source_id, context)
+        donors, recipient = _v5_probe_pair(
+            record,
+            donor_id,
+            _COMPLEMENT_DONOR.format(total=total, passed=total - failed),
+            _COMPLEMENT_RECIPIENT.format(total=total, failed=failed),
+            _COMPLEMENT_QUESTION,
+            "complement_restatement_donor",
+        )
+        return (
+            donors,
+            recipient,
+            _COMPLEMENT_QUESTION,
+            [str(failed)],
+            {
+                "expected_exact": False,
+                "hit_class": "complement_restatement",
+                "expected_verifier_accept": False,
+                "fact_equivalent": True,
+                "fact_probe": failed,
+                "restated_total": total,
+            },
+        )
+    raise ValueError(f"unknown v5 transform: {transform}")
 
 
 def _paraphrase_request(request: str) -> str:
@@ -172,6 +406,8 @@ def _build_item(
     base = _base_prompt(record.context, record.input)
     item_id = stable_id(record.dataset, record.source_id, transform)
     donor_id = stable_id(item_id, "donor")
+    question = record.input
+    answers = record.answers
 
     if transform == "repeat_shifted":
         donors = [DonorPrompt(donor_id=donor_id, text=base, label="base_prompt")]
@@ -263,6 +499,16 @@ def _build_item(
             "entity_swap_source_id": negative_record.source_id,
             "expected_no_fact_leak": True,
         }
+    elif transform in (
+        "fact_paraphrase",
+        "fact_divergent_paraphrase",
+        "arithmetic_restatement",
+        "complement_restatement",
+    ):
+        donors, recipient, question, answers, metadata = _build_v5_probe_item(
+            record=record, transform=transform, donor_id=donor_id
+        )
+        negative = False
     elif transform == "negative_control":
         donor_text = _base_prompt(negative_record.context, negative_record.input)
         donors = [
@@ -289,8 +535,8 @@ def _build_item(
         transform=transform,
         donor_prompts=donors,
         recipient_prompt=recipient,
-        input=record.input,
-        answers=record.answers,
+        input=question,
+        answers=answers,
         negative_control=negative,
         metadata={**record.metadata, **metadata},
     )
