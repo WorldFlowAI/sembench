@@ -1,6 +1,6 @@
 [project]
 name = "sembench"
-version = "0.1.0"
+version = "0.2.0"
 description = "SemBench: benchmark suite for semantic KV cache reuse"
 requires-python = ">=3.10"
 readme = "README.md"
