@@ -40,6 +40,8 @@ def main(argv: list[str] | None = None) -> None:
         cmd_run_live_sglang(args)
     elif args.command == "run-live-gateway":
         cmd_run_live_gateway(args)
+    elif args.command == "run-load":
+        cmd_run_load(args)
     elif args.command == "summarize-engine-events":
         cmd_summarize_engine_events(args)
     elif args.command == "collect-k8s-engine-events":
@@ -207,6 +209,24 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--timeout-seconds", type=float, default=900.0)
     gateway.add_argument("--quality-threshold", type=float, default=0.60)
     gateway.add_argument("--post-donor-delay-ms", type=int, default=0)
+
+    load = sub.add_parser(
+        "run-load",
+        help="Drive donor->recipient streams concurrently; report throughput and TTFT under load",
+    )
+    load.add_argument("--manifest", required=True)
+    load.add_argument("--output", required=True)
+    load.add_argument("--gateway-url", required=True)
+    load.add_argument("--model", required=True)
+    load.add_argument("--tenant", default="tenant-a")
+    load.add_argument("--template", default="rag-template-v1")
+    load.add_argument("--concurrency", type=int, default=4)
+    load.add_argument("--max-items", type=int, default=None)
+    load.add_argument("--donor-max-tokens", type=int, default=1)
+    load.add_argument("--recipient-max-tokens", type=int, default=32)
+    load.add_argument("--post-donor-delay-ms", type=int, default=1000)
+    load.add_argument("--timeout-seconds", type=float, default=1800.0)
+    load.add_argument("--run-id", default="load")
 
     events = sub.add_parser(
         "summarize-engine-events",
@@ -873,3 +893,29 @@ def cmd_assert_result_gates(args) -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def cmd_run_load(args) -> None:
+    import json as _json
+
+    from sembench.load import LoadConfig, run_load
+
+    config = LoadConfig(
+        manifest=args.manifest,
+        output=args.output,
+        gateway_url=args.gateway_url,
+        model=args.model,
+        tenant=args.tenant,
+        template=args.template,
+        concurrency=args.concurrency,
+        max_items=args.max_items,
+        donor_max_tokens=args.donor_max_tokens,
+        recipient_max_tokens=args.recipient_max_tokens,
+        post_donor_delay_ms=args.post_donor_delay_ms,
+        timeout_seconds=args.timeout_seconds,
+        run_id=args.run_id,
+    )
+    doc = run_load(config)
+    with open(args.output, "w", encoding="utf-8") as handle:
+        _json.dump(doc, handle)
+    print(_json.dumps({k: v for k, v in doc.items() if k not in ("donors", "recipients")}, indent=2))
