@@ -49,10 +49,13 @@ class CostModel:
     # is ~230 ms / 3500 tokens. Set 0 for lookup-only mode
     # (register_donors=false) or when capture is moved off the request path.
     capture_per_token_ms: float = 0.065
-    # Hit path: fraction of the prompt served from the donor, and the copy
-    # cost of realizing donor KV into the recipient's blocks.
+    # Hit path: fraction of the prompt served from the donor, and the cost of
+    # realizing donor KV into the recipient's blocks. Measured 2026-09-03
+    # (vLLM, donor KV loaded from the worker's local disk store, 28 layers):
+    # ~150 ms for a 3.5K-token whole-span load, i.e. ~0.04 ms/token; donor
+    # KV resident in host or GPU memory would cut this several-fold.
     served_fraction_on_hit: float = 0.85
-    materialize_per_token_ms: float = 0.02
+    materialize_per_token_ms: float = 0.04
     # Below this prompt length the layer does not engage at all.
     min_prompt_tokens: int = 256
 
