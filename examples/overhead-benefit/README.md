@@ -48,8 +48,7 @@ sembench run-load --manifest amz-hit-16000.jsonl --output tp_conn_hit_16000.json
   (`--max-num-batched-tokens 24576`), `--max-model-len 25600` so a 24K
   prompt plus its output fits, `--gpu-memory-utilization 0.90`.
 - SGLang: `--chunked-prefill-size 8192 --context-length 25600
-  --mem-fraction-static 0.80`, with `SEMBLEND_EMBED_DEVICE=cuda:0` and
-  `SEMBLEND_EMBED_MAX_CHARS=200000` in the server environment so donors
-  and queries are matched on their full text (the default truncation is
-  tuned for CPU embedding and costs same-document hits on multi-passage
-  prompts).
+  --mem-fraction-static 0.80`, with `SEMBLEND_EMBED_DEVICE=cuda:0` in the
+  server environment. Leave the embedding text limit at its default:
+  embedding the full text of long prompts costs more lookup time than it
+  returns in hits (measured at 8K on an A10G).
