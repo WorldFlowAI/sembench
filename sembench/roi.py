@@ -37,7 +37,11 @@ class CostModel:
     prefill_fixed_ms: float = 120.0
     prefill_per_token_ms: float = 0.62
     # Miss path: one embedding + catalog lookup per eligible request.
-    lookup_ms: float = 12.0
+    # Measured 2026-09-03 on vLLM 0.26 + connector, A10G, 3.5K-token
+    # prompts, MiniLM on CPU, chunk fast path off: p50 188 ms. With the
+    # ONNX GPU embedder the embedding drops to single-digit ms; pass
+    # --lookup-ms 15 to model that deployment.
+    lookup_ms: float = 190.0
     # Donor capture: block-aligned KV copy to the donor store, paid by every
     # donor-eligible request when capture is on (set 0 for lookup-only mode).
     capture_per_token_ms: float = 0.004
