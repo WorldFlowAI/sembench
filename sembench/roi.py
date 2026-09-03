@@ -43,8 +43,12 @@ class CostModel:
     # --lookup-ms 15 to model that deployment.
     lookup_ms: float = 190.0
     # Donor capture: block-aligned KV copy to the donor store, paid by every
-    # donor-eligible request when capture is on (set 0 for lookup-only mode).
-    capture_per_token_ms: float = 0.004
+    # donor-eligible request when capture is on. Measured 2026-09-03 (vLLM
+    # 0.26 + connector, A10G, 28 layers, 3.5K-token prompts): the zero-match
+    # arm ran +418 ms p50 over cold, of which ~190 ms is lookup, so capture
+    # is ~230 ms / 3500 tokens. Set 0 for lookup-only mode
+    # (register_donors=false) or when capture is moved off the request path.
+    capture_per_token_ms: float = 0.065
     # Hit path: fraction of the prompt served from the donor, and the copy
     # cost of realizing donor KV into the recipient's blocks.
     served_fraction_on_hit: float = 0.85
