@@ -31,31 +31,34 @@ from dataclasses import asdict, dataclass, field
 class CostModel:
     """Per-request cost coefficients (milliseconds unless noted)."""
 
-    # Cold prefill: TTFT ~= fixed + per_token * prompt_tokens. A10G/7B fp16
-    # measured ~ (120 ms + 0.62 ms/token); H100-class hardware is ~5x faster
-    # per token, so pass your own numbers.
-    prefill_fixed_ms: float = 120.0
-    prefill_per_token_ms: float = 0.62
-    # Miss path: one embedding + catalog lookup per eligible request.
-    # Measured 2026-09-03 on vLLM 0.26 + connector, A10G, 3.5K-token
-    # prompts, MiniLM on CPU, chunk fast path off: p50 188 ms. With the
-    # ONNX GPU embedder the embedding drops to single-digit ms; pass
-    # --lookup-ms 15 to model that deployment.
-    lookup_ms: float = 190.0
-    # Donor capture: block-aligned KV copy to the donor store, paid by every
+    # Cold prefill: TTFT ~= fixed + per_token * prompt_tokens. A10G/7B fp16,
+    # chunked prefill, measured 2026-09-03 on vLLM 0.26 at 8K/16K/24K
+    # tokens: 2.06 s / 4.67 s / 7.61 s, i.e. ~0.30 ms/token with no fixed
+    # term worth modeling in the 8K-24K band. H100-class hardware is ~5x
+    # faster per token, so pass your own numbers.
+    prefill_fixed_ms: float = 0.0
+    prefill_per_token_ms: float = 0.30
+    # Miss path: one embedding + catalog lookup + verification per eligible
+    # request. Measured 2026-09-03 (vLLM 0.26 + connector, A10G, MiniLM on
+    # the engine GPU, windowed alignment): zero-match lookups 156 ms p50 at
+    # 16K tokens; hit-path lookups 261 ms at 8K and 612-652 ms at 16K-24K
+    # (the verification step scales with text length). 300 ms is the
+    # blended figure for the 8K-24K band; pass --lookup-ms for yours.
+    lookup_ms: float = 300.0
+    # Donor capture: KV copy to the worker's donor store, paid by every
     # donor-eligible request when capture is on. Measured 2026-09-03 (vLLM
-    # 0.26 + connector, A10G, 28 layers, 3.5K-token prompts): the zero-match
-    # arm ran +418 ms p50 over cold, of which ~190 ms is lookup, so capture
-    # is ~230 ms / 3500 tokens. Set 0 for lookup-only mode
+    # 0.26 + connector, A10G, host-memory store, 16K-token prompts): the
+    # zero-match arm ran +780 ms p50 over cold, of which ~156 ms is lookup,
+    # so capture is ~0.039 ms/token. Set 0 for lookup-only mode
     # (register_donors=false) or when capture is moved off the request path.
-    capture_per_token_ms: float = 0.065
+    capture_per_token_ms: float = 0.039
     # Hit path: fraction of the prompt served from the donor, and the cost of
     # realizing donor KV into the recipient's blocks. Measured 2026-09-03
-    # (vLLM, donor KV loaded from the worker's local disk store, 28 layers):
-    # ~150 ms for a 3.5K-token whole-span load, i.e. ~0.04 ms/token; donor
-    # KV resident in host or GPU memory would cut this several-fold.
-    served_fraction_on_hit: float = 0.85
-    materialize_per_token_ms: float = 0.04
+    # (vLLM, donor KV in host memory, 28 layers): hit TTFT minus lookup is
+    # ~130 ms at 8K and ~250 ms at 16K, i.e. ~0.016 ms/token; whole-span
+    # paraphrase serves cover ~99% of the prompt.
+    served_fraction_on_hit: float = 0.99
+    materialize_per_token_ms: float = 0.016
     # Below this prompt length the layer does not engage at all.
     min_prompt_tokens: int = 256
 
