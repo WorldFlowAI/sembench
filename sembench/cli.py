@@ -206,6 +206,7 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--recipient-max-tokens", type=int, default=24)
     gateway.add_argument("--timeout-seconds", type=float, default=900.0)
     gateway.add_argument("--quality-threshold", type=float, default=0.60)
+    gateway.add_argument("--post-donor-delay-ms", type=int, default=0)
 
     events = sub.add_parser(
         "summarize-engine-events",
@@ -603,6 +604,7 @@ def cmd_run_live_gateway(args) -> None:
         recipient_max_tokens=args.recipient_max_tokens,
         timeout_seconds=args.timeout_seconds,
         quality_threshold=args.quality_threshold,
+        post_donor_delay_ms=args.post_donor_delay_ms,
     )
     requests = run_live_gateway(config)
     write_result(

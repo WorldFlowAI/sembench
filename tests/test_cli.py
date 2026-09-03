@@ -108,3 +108,20 @@ def test_cli_assert_result_gates_catches_negative_semantic_placement(tmp_path: P
                 "0.0",
             ]
         )
+
+
+def test_live_gateway_accepts_post_donor_delay():
+    """The gateway runner is what long-context campaigns drive; engines that
+    index donors asynchronously need the settle delay, and the flag once
+    existed only on the non-gateway runner."""
+    from sembench.cli import build_parser
+
+    args = build_parser().parse_args(
+        [
+            "run-live-gateway",
+            "--manifest", "m.jsonl", "--output", "o.json",
+            "--gateway-url", "http://127.0.0.1:1", "--model", "m",
+            "--post-donor-delay-ms", "2000",
+        ]
+    )
+    assert args.post_donor_delay_ms == 2000

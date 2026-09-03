@@ -39,6 +39,9 @@ class LiveGatewayConfig:
     recipient_max_tokens: int = 24
     timeout_seconds: float = 900.0
     quality_threshold: float = 0.60
+    # Engines that index donors off the request path need a moment before
+    # the recipient can see them; counted in latency_ms, not in ttft_ms.
+    post_donor_delay_ms: int = 0
 
 
 def run_live_gateway(config: LiveGatewayConfig) -> list[RequestMetrics]:
@@ -65,6 +68,8 @@ def run_live_gateway(config: LiveGatewayConfig) -> list[RequestMetrics]:
                     template=_template_for_item(item, config),
                     timeout_seconds=config.timeout_seconds,
                 )
+            if config.post_donor_delay_ms > 0:
+                time.sleep(config.post_donor_delay_ms / 1000)
             response = _chat_completion(
                 base_url=gateway_base,
                 model=config.model,
