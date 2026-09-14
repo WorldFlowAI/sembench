@@ -293,7 +293,16 @@ def write_result(
     requests: list[RequestMetrics],
     config: dict[str, Any],
     run: RunMetadata | None = None,
+    engine: dict[str, Any] | None = None,
 ) -> None:
+    """Write one arm's result document.
+
+    ``engine`` carries the arm's serve line, the parsed launch flags, and the
+    before/after engine counter window (see ``sembench.engine_config``). The
+    key is always present — null when the arm was run without it — so a
+    reader can tell "no engine config was recorded" from "these were the
+    flags", rather than assuming.
+    """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
     payload = {
@@ -301,6 +310,7 @@ def write_result(
         "created_at_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "run": run.to_dict() if run is not None else None,
         "config": config,
+        "engine": engine,
         "environment": {
             "python": platform.python_version(),
             "platform": platform.platform(),

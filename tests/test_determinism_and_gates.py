@@ -104,18 +104,36 @@ def test_gates_fail_without_materialization_evidence(tmp_path: Path):
     assert excinfo.value.code == 1
 
 
-def test_quality_gate_silently_skipped_when_metric_absent(tmp_path: Path):
-    """Current contract: a missing quality metric passes --min-quality-pass-rate.
-
-    Documented on purpose — tightening this (e.g. a --require-quality-metric
-    flag) is a planned contract change; this test pins today's behavior so the
-    change is deliberate, not accidental.
-    """
+def _strip_quality(tmp_path: Path) -> Path:
     result = _offline_result(tmp_path)
     payload = json.loads(result.read_text())
     payload["aggregate"].pop("quality_pass_rate", None)
     stripped = tmp_path / "stripped.json"
     stripped.write_text(json.dumps(payload))
+    return stripped
+
+
+def test_requested_quality_gate_fails_when_metric_absent(tmp_path: Path):
+    """Contract (deliberately tightened): an explicitly requested gate whose
+    metric is missing FAILS. Skipping it reads as a pass in CI, which is how a
+    gate goes green on a run that never measured the thing it gates."""
+    stripped = _strip_quality(tmp_path)
+    with pytest.raises(SystemExit) as excinfo:
+        main(
+            [
+                "assert-result-gates",
+                "--result",
+                str(stripped),
+                "--min-quality-pass-rate",
+                "0.99",
+            ]
+        )
+    assert excinfo.value.code == 1
+
+
+def test_allow_missing_restores_the_skip_on_an_absent_metric(tmp_path: Path):
+    """The old skip stays available, but only when asked for by name."""
+    stripped = _strip_quality(tmp_path)
     main(
         [
             "assert-result-gates",
@@ -123,5 +141,13 @@ def test_quality_gate_silently_skipped_when_metric_absent(tmp_path: Path):
             str(stripped),
             "--min-quality-pass-rate",
             "0.99",
+            "--allow-missing",
         ]
     )
+
+
+def test_unrequested_gate_still_skips_an_absent_metric(tmp_path: Path):
+    """A caller who never asked for the quality gate is not failed by its
+    absence — only requested gates are enforced."""
+    stripped = _strip_quality(tmp_path)
+    main(["assert-result-gates", "--result", str(stripped)])

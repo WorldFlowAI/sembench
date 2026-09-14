@@ -110,6 +110,10 @@ class RequestMetrics:
     route_total_score: float | None = None
     route_reason: str | None = None
     gateway_route_header: str | None = None
+    # Fleet placement: which worker served the recipient, and which worker each
+    # donor was seeded on. Empty/None on the single-endpoint path.
+    worker_id: str | None = None
+    donor_worker_ids: list[str] = field(default_factory=list)
     ttft_ms: float | None = None
     latency_ms: float | None = None
     output_text: str | None = None

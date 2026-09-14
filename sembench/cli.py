@@ -7,10 +7,23 @@ import json
 import subprocess
 from pathlib import Path
 
+from sembench.engine_config import (
+    attach_engine_document,
+    engine_document,
+    load_engine_flags,
+    phase0_flag_violations,
+    snapshot_document,
+    snapshots_from_document,
+)
 from sembench.engine_events import parse_engine_events
-from sembench.gateway_live import LiveGatewayConfig, run_live_gateway
+from sembench.gateway_live import (
+    LiveGatewayConfig,
+    run_live_gateway,
+    run_live_gateway_measured,
+)
 from sembench.longbench import DEFAULT_LONGBENCH_V1_DATASETS, load_source_records
 from sembench.offline import OfflineConfig, run_offline
+from sembench.prometheus import MetricsWindow, scrape_all
 from sembench.results import write_result
 from sembench.schema import write_jsonl
 from sembench.sglang_live import LiveSglangConfig, run_live_sglang_sync
@@ -42,6 +55,12 @@ def main(argv: list[str] | None = None) -> None:
         cmd_run_live_gateway(args)
     elif args.command == "run-load":
         cmd_run_load(args)
+    elif args.command == "merge-results":
+        cmd_merge_results(args)
+    elif args.command == "engine-snapshot":
+        cmd_engine_snapshot(args)
+    elif args.command == "engine-window":
+        cmd_engine_window(args)
     elif args.command == "summarize-engine-events":
         cmd_summarize_engine_events(args)
     elif args.command == "collect-k8s-engine-events":
@@ -76,6 +95,90 @@ def _add_run_identity_args(parser: argparse.ArgumentParser) -> None:
         action="store_true",
         help="Skip the endpoint pre-flight check (unverified runs are not leaderboard-eligible)",
     )
+
+
+def _add_engine_config_args(parser: argparse.ArgumentParser) -> None:
+    """Engine-identity flags for a live arm.
+
+    A TTFT result whose prefix-caching state, batching limits, CUDA graph
+    mode and --kv-transfer-config were never recorded cannot be compared
+    with another arm; the serve line is part of the measurement.
+    """
+    parser.add_argument(
+        "--engine-serve-command",
+        default=None,
+        help='Verbatim serve line for this arm, e.g. "VLLM_SERVER_DEV_MODE=1 vllm serve ..."',
+    )
+    parser.add_argument(
+        "--engine-serve-command-file",
+        default=None,
+        help="File holding the serve line (for lines too long to pass inline)",
+    )
+    parser.add_argument(
+        "--engine-env",
+        action="append",
+        default=[],
+        metavar="KEY=VALUE",
+        help="Environment that changes engine behaviour, e.g. VLLM_SERVER_DEV_MODE=1",
+    )
+    parser.add_argument(
+        "--metrics-url",
+        action="append",
+        default=[],
+        help="Worker base URL to scrape /metrics from before and after the arm "
+        "(repeatable; defaults to the donor/gateway URL)",
+    )
+    parser.add_argument(
+        "--require-phase0-flags",
+        action="store_true",
+        help="Refuse to run (exit 3) when the serve line is missing a phase-0 flag",
+    )
+
+
+def _engine_metrics_urls(args) -> list[str]:
+    """Endpoints to scrape for this arm, deduped and order-preserving."""
+    if args.metrics_url:
+        candidates = list(args.metrics_url)
+    else:
+        candidates = [
+            *(getattr(args, "worker_url", None) or []),
+            getattr(args, "donor_url", None),
+            getattr(args, "gateway_url", None),
+        ]
+    urls: list[str] = []
+    for url in candidates:
+        if url and url not in urls:
+            urls.append(url)
+    return urls
+
+
+def _engine_flags_or_exit(args):
+    try:
+        return load_engine_flags(
+            serve_command=args.engine_serve_command,
+            serve_command_file=args.engine_serve_command_file,
+            env_assignments=args.engine_env,
+        )
+    except ValueError as exc:
+        raise SystemExit(f"engine config: {exc}") from exc
+
+
+class _GateThreshold(argparse.Action):
+    """A gate threshold, remembering that the caller actually asked for it.
+
+    Gates whose metric is absent used to be skipped, which reads as a pass in
+    CI: that is how a reuse gate goes green on a run that never measured
+    reuse. A gate the caller explicitly requested now fails when its metric is
+    missing, so `requested_gates` has to survive parsing.
+    """
+
+    def __call__(self, parser, namespace, values, option_string=None) -> None:
+        setattr(namespace, self.dest, values)
+        requested = getattr(namespace, "requested_gates", None)
+        if requested is None:
+            requested = set()
+            setattr(namespace, "requested_gates", requested)
+        requested.add(self.dest)
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -194,6 +297,7 @@ def build_parser() -> argparse.ArgumentParser:
         "run-live-gateway", help="Replay a manifest through an OpenAI-compatible gateway"
     )
     _add_run_identity_args(gateway)
+    _add_engine_config_args(gateway)
     gateway.add_argument("--manifest", required=True)
     gateway.add_argument("--output", required=True)
     gateway.add_argument("--gateway-url", required=True)
@@ -209,6 +313,58 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--timeout-seconds", type=float, default=900.0)
     gateway.add_argument("--quality-threshold", type=float, default=0.60)
     gateway.add_argument("--post-donor-delay-ms", type=int, default=0)
+    gateway.add_argument(
+        "--concurrency",
+        type=int,
+        default=1,
+        help="Request streams in flight at once (default 1 = serial, unchanged). "
+        "Above 1 the run also writes a throughput document; TTFT stays per-request, "
+        "measured at the streamed first token",
+    )
+    gateway.add_argument(
+        "--min-donor-gap-requests",
+        type=int,
+        default=0,
+        help="Minimum donor->recipient separation in COMPLETED requests, for manifests "
+        "that name their donor in metadata.donor_item_id. Under concurrency a gap "
+        "measured in stream positions does not hold",
+    )
+    gateway.add_argument(
+        "--throughput-output",
+        default=None,
+        metavar="PATH",
+        help="Where to write the throughput document (default: <output> with a "
+        ".throughput.json suffix, written whenever --concurrency > 1)",
+    )
+    gateway.add_argument(
+        "--paired",
+        action="store_true",
+        help="Run a cold and a warm twin per item, adjacent in the stream (requires --reset-url)",
+    )
+    gateway.add_argument(
+        "--reset-url",
+        action="append",
+        dest="reset_urls",
+        default=[],
+        metavar="URL",
+        help="Engine cache-reset endpoint POSTed before each arm; repeat per worker "
+        "(vLLM: http://host:8000/reset_prefix_cache?reset_external=true)",
+    )
+
+    merge = sub.add_parser(
+        "merge-results",
+        help="Join a cold and a warm single-arm result into one paired result by item_id",
+    )
+    merge.add_argument("--cold", required=True, help="Result JSON for the cold (baseline) arm")
+    merge.add_argument("--warm", required=True, help="Result JSON for the warm (treatment) arm")
+    merge.add_argument("--output", required=True)
+    merge.add_argument("--run-id", default=None)
+    merge.add_argument(
+        "--allow-unpaired",
+        action="store_true",
+        help="Merge anyway when the arms do not join one-to-one (the pairing report still "
+        "records every unpaired row; the paired summary is then a subset, not the run)",
+    )
 
     load = sub.add_parser(
         "run-load",
@@ -227,6 +383,30 @@ def build_parser() -> argparse.ArgumentParser:
     load.add_argument("--post-donor-delay-ms", type=int, default=1000)
     load.add_argument("--timeout-seconds", type=float, default=1800.0)
     load.add_argument("--run-id", default="load")
+    load.add_argument("--min-donor-gap-requests", type=int, default=0)
+
+    snapshot = sub.add_parser(
+        "engine-snapshot",
+        help="Read the engine's external-KV Prometheus counters (run before and after an arm)",
+    )
+    snapshot.add_argument("--metrics-url", action="append", default=[], required=True)
+    snapshot.add_argument("--output", required=True)
+    snapshot.add_argument("--timeout-seconds", type=float, default=15.0)
+
+    window = sub.add_parser(
+        "engine-window",
+        help="Combine two engine snapshots plus the serve line into a result's engine block",
+    )
+    _add_engine_config_args(window)
+    window.add_argument("--before", required=True, help="Snapshot taken before the arm")
+    window.add_argument("--after", required=True, help="Snapshot taken after the arm")
+    window.add_argument("--arm", default="single")
+    window.add_argument("--output", default=None, help="Write the engine block here")
+    window.add_argument(
+        "--result",
+        default=None,
+        help="Result JSON to splice the engine block into (for arms run by another driver)",
+    )
 
     events = sub.add_parser(
         "summarize-engine-events",
@@ -256,22 +436,42 @@ def build_parser() -> argparse.ArgumentParser:
     )
     gates.add_argument("--result", required=True)
     gates.add_argument("--engine-summary", action="append", default=[])
-    gates.add_argument("--min-quality-pass-rate", type=float, default=0.0)
-    gates.add_argument("--min-semantic-placement-rate", type=float, default=0.0)
-    gates.add_argument("--min-backend-confirmed-block-rate", type=float, default=0.0)
+    gates.add_argument("--min-quality-pass-rate", type=float, default=0.0, action=_GateThreshold)
+    gates.add_argument(
+        "--min-semantic-placement-rate", type=float, default=0.0, action=_GateThreshold
+    )
+    gates.add_argument(
+        "--min-backend-confirmed-block-rate", type=float, default=0.0, action=_GateThreshold
+    )
     gates.add_argument("--min-materialization-events", type=int, default=0)
     gates.add_argument("--min-materialized-tokens", type=int, default=0)
     gates.add_argument("--min-materialized-units", type=int, default=0)
-    gates.add_argument("--max-negative-control-confirmed-rate", type=float, default=0.0)
-    gates.add_argument("--max-negative-control-semantic-placement-rate", type=float, default=1.0)
+    gates.add_argument(
+        "--max-negative-control-confirmed-rate", type=float, default=0.0, action=_GateThreshold
+    )
+    gates.add_argument(
+        "--max-negative-control-semantic-placement-rate",
+        type=float,
+        default=1.0,
+        action=_GateThreshold,
+    )
     gates.add_argument("--require-materialized-reuse", action="store_true")
     gates.add_argument("--require-no-engine-errors", action="store_true")
-    gates.add_argument("--min-blended-ttft-speedup", type=float, default=None)
+    gates.add_argument(
+        "--min-blended-ttft-speedup", type=float, default=None, action=_GateThreshold
+    )
     gates.add_argument(
         "--max-negative-control-speedup-deviation",
         type=float,
         default=None,
+        action=_GateThreshold,
         help="Max allowed |negative-control speedup - 1.0| (cache must not fire on unrelated content)",
+    )
+    gates.add_argument(
+        "--allow-missing",
+        action="store_true",
+        help="Skip an explicitly requested gate whose metric is absent instead of failing "
+        "(a skipped gate reads as a pass: say so on purpose)",
     )
     gates.add_argument(
         "--require-contamination-check",
@@ -287,6 +487,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-warm-vs-cold-rouge-drop",
         type=float,
         default=None,
+        action=_GateThreshold,
         help="Max allowed drop of paired warm-vs-cold ROUGE-L below the calibrated floor (requires --noise-floor-calibration)",
     )
 
@@ -608,6 +809,21 @@ def cmd_run_live_sglang(args) -> None:
 
 
 def cmd_run_live_gateway(args) -> None:
+    # Validate the arm wiring before any traffic: a run that stamps the wrong
+    # arm is only discoverable after the GPU time is already spent.
+    if args.paired and args.arm != "single":
+        raise SystemExit(
+            "--paired stamps cold and warm per item; drop --arm "
+            f"(got --arm {args.arm}). Use --arm for two separate runs joined "
+            "by `sembench merge-results`."
+        )
+    if args.paired and not args.reset_urls:
+        raise SystemExit(
+            "--paired requires --reset-url: without an engine cache reset the cold "
+            "twin is warmed by the arm before it. For stock vLLM, serve with "
+            "VLLM_SERVER_DEV_MODE=1 and pass "
+            "--reset-url http://<worker>/reset_prefix_cache?reset_external=true"
+        )
     detected_version = _preflight(args, engine="gateway", base_url=args.gateway_url)
     config = LiveGatewayConfig(
         manifest=args.manifest,
@@ -625,8 +841,31 @@ def cmd_run_live_gateway(args) -> None:
         timeout_seconds=args.timeout_seconds,
         quality_threshold=args.quality_threshold,
         post_donor_delay_ms=args.post_donor_delay_ms,
+        arm=args.arm,
+        paired=args.paired,
+        reset_urls=tuple(args.reset_urls),
+        concurrency=args.concurrency,
+        min_donor_gap_requests=args.min_donor_gap_requests,
     )
-    requests = run_live_gateway(config)
+    engine_flags = _engine_flags_or_exit(args)
+    violations = (
+        phase0_flag_violations(engine_flags)
+        if engine_flags is not None
+        else ["no serve command recorded for this arm (--engine-serve-command)"]
+    )
+    if violations and args.require_phase0_flags:
+        print(json.dumps({"phase0_flag_violations": violations}, indent=2))
+        raise SystemExit(3)
+    # Counters are read around the arm so the result carries a delta, not a
+    # process-lifetime total inherited from whatever ran before it.
+    metrics_urls = _engine_metrics_urls(args)
+    before = tuple(scrape_all(metrics_urls))
+    # A run that was asked for a throughput document needs the measured
+    # variant; a plain serial arm is the same replay either way.
+    wants_throughput = args.concurrency > 1 or bool(args.throughput_output)
+    run = run_live_gateway_measured(config) if wants_throughput else None
+    requests = list(run.requests) if run is not None else run_live_gateway(config)
+    after = tuple(scrape_all(metrics_urls))
     write_result(
         args.output,
         requests=requests,
@@ -635,8 +874,154 @@ def cmd_run_live_gateway(args) -> None:
             **config.__dict__,
         },
         run=_run_metadata(args, engine="gateway", engine_version=detected_version),
+        engine=engine_document(
+            arm=args.arm,
+            flags=engine_flags,
+            window=MetricsWindow(before=before, after=after),
+        ),
     )
-    print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
+    summary = {"output": args.output, "requests": len(requests)}
+    if run is not None:
+        throughput_path = write_throughput_document(
+            output=args.output,
+            explicit_path=args.throughput_output,
+            document=run.throughput,
+        )
+        summary["throughput_output"] = throughput_path
+        summary["requests_per_second"] = run.throughput.get("requests_per_second")
+        summary["requests_per_second_excluding_settle"] = run.throughput.get(
+            "requests_per_second_excluding_settle"
+        )
+    print(json.dumps(summary, indent=2))
+
+
+def throughput_document_path(output: str, explicit_path: str | None = None) -> str:
+    """Where a run's throughput document goes: beside its result, by default."""
+    if explicit_path:
+        return explicit_path
+    return str(Path(output).with_suffix(".throughput.json"))
+
+
+def write_throughput_document(
+    *,
+    output: str,
+    explicit_path: str | None,
+    document: dict,
+) -> str:
+    path = Path(throughput_document_path(output, explicit_path))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    return str(path)
+
+
+def _arm_provenance(payload: dict) -> dict:
+    """What a merged result keeps about one source arm."""
+    return {
+        "run": payload.get("run"),
+        "config": payload.get("config"),
+        "engine": payload.get("engine"),
+    }
+
+
+def cmd_merge_results(args) -> None:
+    """Join two single-arm results into one paired result.
+
+    Arms usually run as separate server processes (stock baseline vs
+    connector), so the pairing has to be reconstructed. It is reconstructed by
+    item_id and nothing else: both arms must have replayed the same manifest
+    bytes, each item must appear exactly once per arm, and the two rows must
+    carry the same manifest-derived fingerprint. Anything else is reported and
+    refused rather than quietly summarized.
+    """
+    from sembench.pairing import (
+        join_arms,
+        merged_run_metadata,
+        requests_from_result,
+        result_manifest_sha256,
+    )
+
+    try:
+        cold_payload = json.loads(Path(args.cold).read_text(encoding="utf-8"))
+        warm_payload = json.loads(Path(args.warm).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"merge-results: {exc}") from exc
+
+    rows, report = join_arms(
+        requests_from_result(cold_payload),
+        requests_from_result(warm_payload),
+        cold_manifest_sha256=result_manifest_sha256(cold_payload),
+        warm_manifest_sha256=result_manifest_sha256(warm_payload),
+    )
+    if not report.ok and not args.allow_unpaired:
+        print(
+            json.dumps(
+                {"merged": False, "output": None, "pairing": report.to_dict()},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1)
+
+    write_result(
+        args.output,
+        requests=rows,
+        config={
+            "mode": "merge-results",
+            "cold_result": args.cold,
+            "warm_result": args.warm,
+            "allow_unpaired": bool(args.allow_unpaired),
+            "pairing": report.to_dict(),
+            "arms": {
+                "cold": _arm_provenance(cold_payload),
+                "warm": _arm_provenance(warm_payload),
+            },
+        },
+        run=merged_run_metadata(cold_payload, warm_payload, run_id=args.run_id),
+    )
+    print(
+        json.dumps(
+            {"merged": True, "output": args.output, "pairing": report.to_dict()},
+            indent=2,
+            sort_keys=True,
+        )
+    )
+
+
+def cmd_engine_snapshot(args) -> None:
+    document = snapshot_document(
+        scrape_all(list(args.metrics_url), timeout=args.timeout_seconds)
+    )
+    encoded = json.dumps(document, indent=2, sort_keys=True)
+    Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+    Path(args.output).write_text(encoded + "\n", encoding="utf-8")
+    print(encoded)
+
+
+def cmd_engine_window(args) -> None:
+    engine_flags = _engine_flags_or_exit(args)
+    try:
+        before = snapshots_from_document(json.loads(Path(args.before).read_text(encoding="utf-8")))
+        after = snapshots_from_document(json.loads(Path(args.after).read_text(encoding="utf-8")))
+    except (OSError, ValueError, json.JSONDecodeError) as exc:
+        raise SystemExit(f"engine window: {exc}") from exc
+
+    document = engine_document(
+        arm=args.arm,
+        flags=engine_flags,
+        window=MetricsWindow(before=before, after=after),
+    )
+    if args.result:
+        try:
+            attach_engine_document(args.result, document)
+        except ValueError as exc:
+            raise SystemExit(f"engine window: {exc}") from exc
+    encoded = json.dumps(document, indent=2, sort_keys=True)
+    if args.output:
+        Path(args.output).parent.mkdir(parents=True, exist_ok=True)
+        Path(args.output).write_text(encoded + "\n", encoding="utf-8")
+    print(encoded)
+    if args.require_phase0_flags and not document["phase0_flags_ok"]:
+        raise SystemExit(3)
 
 
 def cmd_summarize_engine_events(args) -> None:
@@ -741,45 +1126,75 @@ def cmd_assert_result_gates(args) -> None:
         json.loads(Path(path).read_text(encoding="utf-8")) for path in args.engine_summary
     ]
     failures: list[str] = []
+    missing_metrics: list[str] = []
+    requested = set(getattr(args, "requested_gates", None) or ())
+    allow_missing = bool(getattr(args, "allow_missing", False))
 
     def require(name: str, ok: bool, detail: str) -> None:
         if not ok:
             failures.append(f"{name}: {detail}")
 
+    def require_metric(name: str, dest: str, value, ok, detail: str) -> None:
+        """Gate a metric that may be absent from the result.
+
+        An absent metric is not a pass. When the caller explicitly asked for
+        the gate, a missing metric FAILS: silently skipping is how an
+        unmeasured reuse gate goes green. --allow-missing opts back into the
+        skip, on the record.
+        """
+        if value is None:
+            missing_metrics.append(name)
+            if dest in requested and not allow_missing:
+                option = "--" + dest.replace("_", "-")
+                require(
+                    name,
+                    False,
+                    f"metric absent from the result but {option} was requested "
+                    "(pass --allow-missing to skip it deliberately)",
+                )
+            return
+        require(name, ok(float(value)), detail)
+
     quality = aggregate.get("quality_pass_rate")
-    if quality is not None:
-        require(
-            "quality_pass_rate",
-            float(quality) >= args.min_quality_pass_rate,
-            f"{quality} < {args.min_quality_pass_rate}",
-        )
-    semantic_placement = float(aggregate.get("semantic_placement_rate_by_request") or 0.0)
-    require(
+    require_metric(
+        "quality_pass_rate",
+        "min_quality_pass_rate",
+        quality,
+        lambda value: value >= args.min_quality_pass_rate,
+        f"{quality} < {args.min_quality_pass_rate}",
+    )
+    semantic_placement = aggregate.get("semantic_placement_rate_by_request")
+    require_metric(
         "semantic_placement_rate_by_request",
-        semantic_placement >= args.min_semantic_placement_rate,
+        "min_semantic_placement_rate",
+        semantic_placement,
+        lambda value: value >= args.min_semantic_placement_rate,
         f"{semantic_placement} < {args.min_semantic_placement_rate}",
     )
     backend_rate = aggregate.get("backend_confirmed_block_rate")
-    if backend_rate is not None:
-        require(
-            "backend_confirmed_block_rate",
-            float(backend_rate) >= args.min_backend_confirmed_block_rate,
-            f"{backend_rate} < {args.min_backend_confirmed_block_rate}",
-        )
+    require_metric(
+        "backend_confirmed_block_rate",
+        "min_backend_confirmed_block_rate",
+        backend_rate,
+        lambda value: value >= args.min_backend_confirmed_block_rate,
+        f"{backend_rate} < {args.min_backend_confirmed_block_rate}",
+    )
     negative_rate = aggregate.get("negative_control_backend_confirmed_rate")
-    if negative_rate is not None:
-        require(
-            "negative_control_backend_confirmed_rate",
-            float(negative_rate) <= args.max_negative_control_confirmed_rate,
-            f"{negative_rate} > {args.max_negative_control_confirmed_rate}",
-        )
+    require_metric(
+        "negative_control_backend_confirmed_rate",
+        "max_negative_control_confirmed_rate",
+        negative_rate,
+        lambda value: value <= args.max_negative_control_confirmed_rate,
+        f"{negative_rate} > {args.max_negative_control_confirmed_rate}",
+    )
     negative_semantic_placement = aggregate.get("negative_control_semantic_placement_rate")
-    if negative_semantic_placement is not None:
-        require(
-            "negative_control_semantic_placement_rate",
-            float(negative_semantic_placement) <= args.max_negative_control_semantic_placement_rate,
-            f"{negative_semantic_placement} > {args.max_negative_control_semantic_placement_rate}",
-        )
+    require_metric(
+        "negative_control_semantic_placement_rate",
+        "max_negative_control_semantic_placement_rate",
+        negative_semantic_placement,
+        lambda value: value <= args.max_negative_control_semantic_placement_rate,
+        f"{negative_semantic_placement} > {args.max_negative_control_semantic_placement_rate}",
+    )
 
     materialization_events = sum(
         int(summary.get("materialization_events") or 0) for summary in engine_summaries
@@ -819,21 +1234,45 @@ def cmd_assert_result_gates(args) -> None:
     if args.require_no_engine_errors:
         require("engine_errors", not engine_errors, f"{len(engine_errors)} errors present")
 
+    # Every gate below reads `paired`, which is null unless the run produced
+    # both arms. A null paired block used to make those gates evaporate, so a
+    # single-arm result could satisfy a speedup gate it never measured.
+    paired_present = result.get("paired") is not None
+    paired_gates = requested & {
+        "min_blended_ttft_speedup",
+        "max_negative_control_speedup_deviation",
+        "max_warm_vs_cold_rouge_drop",
+    }
+    if args.require_contamination_check:
+        paired_gates = paired_gates | {"require_contamination_check"}
+    if paired_gates and not paired_present and not allow_missing:
+        missing_metrics.append("paired")
+        require(
+            "paired_summary",
+            False,
+            "result has no paired summary, so "
+            f"{', '.join(sorted(paired_gates))} cannot be evaluated: run the gateway "
+            "with --paired, or join two single-arm results with `sembench merge-results`",
+        )
+
     if args.min_blended_ttft_speedup is not None:
         blended = paired.get("blended_ttft_speedup_mean")
-        require(
+        require_metric(
             "blended_ttft_speedup",
-            blended is not None and float(blended) >= args.min_blended_ttft_speedup,
+            "min_blended_ttft_speedup",
+            blended,
+            lambda value: value >= args.min_blended_ttft_speedup,
             f"{blended} < {args.min_blended_ttft_speedup}",
         )
     if args.max_negative_control_speedup_deviation is not None:
         negative_speedup = paired.get("negative_control_ttft_speedup_mean")
-        if negative_speedup is not None:
-            require(
-                "negative_control_ttft_speedup",
-                abs(float(negative_speedup) - 1.0) <= args.max_negative_control_speedup_deviation,
-                f"|{negative_speedup} - 1.0| > {args.max_negative_control_speedup_deviation}",
-            )
+        require_metric(
+            "negative_control_ttft_speedup",
+            "max_negative_control_speedup_deviation",
+            negative_speedup,
+            lambda value: abs(value - 1.0) <= args.max_negative_control_speedup_deviation,
+            f"|{negative_speedup} - 1.0| > {args.max_negative_control_speedup_deviation}",
+        )
     if args.require_contamination_check:
         require(
             "paired_contamination",
@@ -884,15 +1323,16 @@ def cmd_assert_result_gates(args) -> None:
             "materialized_units": materialized_units,
             "materialized_reuse": materialized_reuse,
             "engine_error_count": len(engine_errors),
+            "paired_present": paired_present,
+            "pairs_used": paired.get("pairs_used"),
         },
+        "requested_gates": sorted(requested),
+        "missing_metrics": sorted(set(missing_metrics)),
+        "allow_missing": allow_missing,
     }
     print(json.dumps(payload, indent=2, sort_keys=True))
     if failures:
         raise SystemExit(1)
-
-
-if __name__ == "__main__":
-    main()
 
 
 def cmd_run_load(args) -> None:
@@ -914,8 +1354,13 @@ def cmd_run_load(args) -> None:
         post_donor_delay_ms=args.post_donor_delay_ms,
         timeout_seconds=args.timeout_seconds,
         run_id=args.run_id,
+        min_donor_gap_requests=args.min_donor_gap_requests,
     )
     doc = run_load(config)
     with open(args.output, "w", encoding="utf-8") as handle:
         _json.dump(doc, handle)
     print(_json.dumps({k: v for k, v in doc.items() if k not in ("donors", "recipients")}, indent=2))
+
+
+if __name__ == "__main__":
+    main()
