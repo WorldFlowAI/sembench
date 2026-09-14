@@ -291,7 +291,7 @@ joined.
 
 ### The manifest's half of the join
 
-None of the four inputs below can come from an engine, so `run-live-gateway`'s
+None of the inputs below can come from an engine, so `run-live-gateway`'s
 row constructor stamps them from `WorkloadItem.metadata` (via
 `manifest_expectations` in `sembench/schema.py`):
 
@@ -306,6 +306,11 @@ rope_delta_bucket              0 | 128 | 512 | 2048 on the rope_delta_sweep clas
                                null elsewhere -- M6's quality split
 stream_position                the item's place in the replay order -- M3 pairs
                                twins at the same position
+wrapper_id                     the instruction wrapper the prompt was built with
+                               (w1-terse ... w8-workflow)
+wrapper_rank                   its rank in the workload's Zipf popularity order,
+                               0 = most popular -- M1's shared-wrapper vs ad-hoc
+                               strata; null is "no wrapper declared", not rank 0
 ```
 
 Both live runners stamp them: `run-live-gateway` and `run-live-sglang`. A row
@@ -401,6 +406,12 @@ alignment_given_opportunity_denominator_source
 alignment_given_opportunity_rows_present  same numerator over the rows held
 alignment_given_opportunity_rows_present_denominator
 boundary_alignment_rate                   alias of alignment_given_opportunity
+alignment_by_wrapper_stratum              M1 per stratum: shared_wrapper / ad_hoc /
+                                          unstratified, each with the three M1
+                                          numbers and their numerators
+wrapper_stratum_rule                      the stratum boundary, stated in the document
+wrapper_stratum_head_share                what the PINNED boundary selected here
+wrapper_stratum_head_is_majority          false when it no longer selects a majority
 boundary_miss_breakdown                   M1, {reason: count}
 span_decline_breakdown                    M1, {decline event: count}
 expected_supplied_tokens_agreement_rate   M1 integrity check + _numerator / _denominator
@@ -513,6 +524,93 @@ both an expectation and an advertise, and the same for
 `expected_span_target_start`. Divergence on the token count means the offline
 model and the live engine disagree about the planner — investigate.
 
+##### The wrapper strata: `alignment_by_wrapper_stratum`
+
+Section 4 is explicit: **"Do not report a single blended alignment number.
+Report it separately for the shared-wrapper stratum and the ad-hoc stratum."**
+Alignment is a property of the token-level tail the donor and the recipient
+wrapper share (caveat A of the plan), so a blended rate over a
+popularity-skewed stream mostly reports which wrapper happened to be popular.
+
+The manifest stamps `wrapper_id` (`w1-terse` … `w8-workflow`) and
+`wrapper_rank` (0 = most popular) on every row, through the same
+`manifest_expectations` path that carries `traffic_class`, `rope_delta_bucket`
+and `stream_position`. The stratum rule, published in the document itself as
+`wrapper_stratum_rule`:
+
+```text
+shared_wrapper   wrapper_rank <= 1   (w1-terse, w2-retrieval)
+ad_hoc           wrapper_rank >= 2   (w3-extractive … w8-workflow)
+unstratified     wrapper_rank null   (the manifest named no wrapper)
+```
+
+**This boundary is an interpretation, and here is the one it rejected.** The
+plan asks for the split (line 343) and defines neither "shared-wrapper" nor
+"ad-hoc". The wording it uses elsewhere is pairwise — caveat A is about "the
+donor and recipient wrappers" sharing a token-level tail, and the class table
+asserts `donor.wrapper_id != recipient.wrapper_id` on `same_doc_new_instruction`
+— so the closer literal reading is **donor/recipient wrapper identity**, which
+the manifest's `donor_item_id` makes computable. It is rejected because it is
+degenerate for M1: M1's opportunity population is `same_doc_new_instruction ∪
+revised_doc`, and `same_doc_new_instruction` is wrapper-mismatched *by
+construction*, so a donor-identity "shared" stratum would be near-empty and
+explain nothing. The reading taken instead is **popularity**, which is what the
+plan's own mechanism sentence (line 128, "the shared wrapper never enters the
+prefix cache") is about: the wrapper the bulk of the stream sits on, which is
+what makes `boundary > 0` at all.
+
+**Why rank 1 is the boundary.** Stream B draws its eight wrappers from
+Zipf(s=1.1) (`phase0-build-manifest.py`: `WRAPPERS`,
+`zipf_weights(len(WRAPPERS), 1.1)`), which puts 39.8% of the stream on rank 0,
+18.6% on rank 1, and under 9% on every rank below. Ranks 0–1 are therefore the
+smallest prefix of the popularity order carrying a **majority** of the traffic
+— 58.4% modelled, 56.1% of the 1,250 real rows in `phase0-stream-b.jsonl`
+(479 + 222). That is what "shared wrapper" means operationally: the head the
+bulk of the stream sits on, so the **recipient's own** wrapper is routinely
+already resident in the prefix cache and its `boundary` is non-zero — lane 2's
+precondition, and what the plan's line-128 mechanism is about. It is **not** a
+claim that the donor was built with the same wrapper: in M1's opportunity
+population the donor's wrapper differs from the recipient's by construction
+(of the 450 `same_doc_new_instruction ∪ revised_doc` items in
+`phase0-stream-b.jsonl`, the 225 that name a `donor_item_id` share the
+recipient's `wrapper_id` in **zero** cases), which is precisely why the
+identity reading was rejected two paragraphs up. Everything below the head is
+ad-hoc traffic whose recipient wrapper is usually cold, so the token-level tail
+alignment is a property of is a different one.
+
+**The constant is pinned, so the document checks it.** `SHARED_WRAPPER_MAX_RANK`
+is derived from that manifest and hardcoded, and on a manifest with a different
+wrapper count or a different Zipf exponent the published rule ("the head the
+majority of the stream sits on") would quietly stop being true. Every document
+therefore publishes what the constant actually selected on its own rows:
+
+```text
+wrapper_stratum_head_share       shared_wrapper rows / rows that declared a rank
+                                 (null when no row declared one)
+wrapper_stratum_head_is_majority false when the pinned boundary no longer
+                                 selects a majority of the ranked rows
+```
+
+A false majority flag does not invalidate the split — the strata still
+partition the rows and still sum to the blended numerator — it says the
+*name* has drifted from the manifest, and the boundary needs rederiving before
+the stratum labels are quoted.
+
+Each stratum publishes M1's three numbers over its own rows —
+`alignment_given_match`, `alignment_given_opportunity`,
+`boundary_miss_breakdown` (plus `span_decline_breakdown` and
+`rows_considered`) — each with its numerator and denominator. The per-stratum
+opportunity denominator is always `rows_present`: the manifest's class counts
+are not split by wrapper, so there is no workload-level number to divide by and
+mixing one in would compare a manifest count with a row count.
+
+The three strata partition the rows the audit was joined to, so **the
+per-stratum numerators sum to the blended numerator**: the split explains the
+headline and cannot change it. `unstratified` exists so that identity holds on
+a manifest predating `wrapper_id` — those rows are named rather than folded
+into a stratum they never declared. `alignment_by_wrapper_stratum` is null when
+no connector audit was joined, like every other rate in this block.
+
 #### M2 — materialized reuse
 
 ```text
@@ -565,13 +663,57 @@ miss_tax_cold_ttft_p50_ms
 miss_tax_pairs                           pairs in the population
 miss_tax_pairs_without_ttft              in the population, but one arm never answered
 miss_tax_pairs_advertising_excluded      pairs whose warm row advertised
+miss_tax_pairs_not_audited_excluded      pairs whose warm row the audit never spoke
+                                         about (audit_joined false or absent)
+miss_tax_pairs_outside_capture_class_excluded
+                                         non-advertising pairs the capture leg's
+                                         no_reuse filter removed (0 on every other pair)
 miss_tax_pairs_negative_control_excluded
 miss_tax_definition                      the population, stated in the document
+miss_tax_population                      the population RULE this document applied
+miss_tax_source                          "connector_audit", or why the population
+                                         could not be identified
 miss_tax_lookup_latency_ms_sum           section 4's scheduler-thread leg, from the
 miss_tax_lookups_total                   arm's engine counter window
 miss_tax_lookup_ms_per_lookup
 miss_tax_lookup_cost_source              "engine_window", or null when unmeasured
 ```
+
+**The population is the pairs the audit measured, row by row.**
+`audit_advertised_tokens` is null both when the connector looked and advertised
+nothing *and* when the audit holds nothing about the request at all — every
+`MATCH_MISSING` row, which the join stamps `audit_joined=false`. Reading the
+second as the first prices the connector's miss path with requests no connector
+event ever described, so a pair whose warm row the audit did not speak about is
+dropped into `miss_tax_pairs_not_audited_excluded` **before** the "advertised
+nothing" filter runs. That is the same row-level rule M1 and M2 apply through
+`auditable_rows`: one definition of "the audit measured this row", shared by
+all three.
+
+**Without a joined audit the tax is unmeasured.** Above the row filter sits the
+document-level guard the per-arm block applies (`audit_was_joined` over the
+warm rows). With no audit anywhere, `miss_tax_ms`,
+`miss_tax_ms_median_of_differences` (+ `_ci`), both p50s and the population
+counts — `miss_tax_pairs`, `miss_tax_pairs_without_ttft`,
+`miss_tax_pairs_advertising_excluded`, `miss_tax_pairs_not_audited_excluded`
+and `miss_tax_pairs_outside_capture_class_excluded` — are null,
+`miss_tax_source` says the population **could not be identified**, and
+`miss_tax_population` says nothing was placed in it. Null here means
+unmeasured, never "no tax". Two things are deliberately *not* in that list and
+are always published: `miss_tax_pairs_negative_control_excluded`, which is a
+property of the pair set rather than of the audited population, and the
+`miss_tax_definition` / `_population` / `_source` strings, which state the rule
+the document applied — including the rule that it could not be applied.
+
+**The capture leg has its own population.** Section 4 defines the capture cost
+as "A3 → A4 delta on `no_reuse` items", so on a document merged with
+`--pair m4_capture` the population is the non-advertising pairs **that are
+`no_reuse`**, and `miss_tax_population` names that rule. A
+`same_doc_new_instruction` request that merely failed to advertise is a miss,
+not a capture: pricing the capture path with it charges the connector for
+traffic that had a donor. The pairs the filter removed are counted in
+`miss_tax_pairs_outside_capture_class_excluded`; on every other document that
+counter is `0` and the population is section 4's plain "supplied == 0".
 
 Section 4 decomposes the tax into three legs. Only the first is a per-arm
 counter ratio (`lookup_latency_ms_sum / lookups_total`), and it is available
@@ -589,11 +731,35 @@ M7 is a **cross-arm answer comparison**, so it lives in the `paired` block and
 needs both arms:
 
 ```text
-propagation_contamination_rate            + _numerator / _denominator
+propagation_contamination_rate            null unless some run is IDENTIFIED as the
+                                          cold (A1) arm and it scored a probe
+propagation_contamination_numerator       propagated probes; null with the rate
 propagation_contamination_denominator     the PROBE SET, not the scored probes
 propagation_probe_set_source              "manifest" or "rows_present"
 propagation_contamination_rate_scored_only
                                           + propagation_contamination_scored_denominator
+propagation_cold_reference_arm            never null, and never provenance when
+                                          _missing is true. Three shapes: an arm id
+                                          ("A1") = that arm answered; "undeclared" =
+                                          neither the reference document nor
+                                          run.baseline_id named an arm; "required: A1" =
+                                          the baseline is a known arm that is NOT the
+                                          cold reference, so A1 is still needed
+propagation_cold_reference_source         "reference_arm" | "reference_arm_undeclared"
+                                          | "baseline_arm"; null whenever _missing
+propagation_cold_reference_missing        true when no arm on this document answered as
+                                          the cold reference — including when it names
+                                          no arm at all
+propagation_cold_reference_unusable       true when one was SUPPLIED and scored no
+                                          probe at all (wrong manifest, rows stamped
+                                          warm, every probe position-mismatched)
+propagation_contamination_rate_vs_baseline_arm
+                                          the same comparison against THIS document's
+                                          baseline arm; a diagnostic, never section 4's
+                                          metric
+propagation_contamination_numerator_vs_baseline_arm
+                                          its numerator; always published, because the
+                                          diagnostic is always computed
 propagation_definition                    what the comparison actually did
 propagation_probe_pairs                   probe items present in both arms
 propagation_probes_excluded_unclean_pair  no twin, contaminated cold arm, an error,
@@ -601,8 +767,75 @@ propagation_probes_excluded_unclean_pair  no twin, contaminated cold arm, an err
 propagation_probes_unlinked               no parent_item_id on the row
 propagation_probes_without_served_answer  parent absent, or answered nothing
 propagation_probes_without_answers        probe missing an answer in an arm
+propagation_probes_without_cold_reference the cold reference arm holds no usable
+                                          answer for this probe
+propagation_probes_reference_position_mismatched
+                                          the reference row sat at another stream
+                                          position, so it answered another stream
 propagation_probes_absent_from_run        declared by the manifest, no row here
 ```
+
+**The cold answer is A1's, not the merge baseline's.** Section 4 says the
+fraction "whose answer in A6 matches the *served* output rather than the
+*cold* (A1) output" — and the `m7_propagation` merge's baseline arm is **A4**,
+the product arm, which can be contaminated on the very same probe. When both
+merged arms drift towards the served answer they drift together, the strict
+comparison finds no difference, and a fully contaminated workload can publish
+`0.0`. So the reference is explicit and named in the document:
+
+- `merge-results --cold-reference <A1 result.json>` supplies it. Reference
+  rows are matched by `item_id` **and** stream position — a reference row at
+  another position replayed a different stream and is not this probe's cold
+  answer (counted in `propagation_probes_reference_position_mismatched`).
+  `propagation_cold_reference_source` reads `reference_arm`, and
+  `propagation_cold_reference_arm` is the arm **that document declares** for
+  itself. `--cold-reference-arm` (default `A1`) is an operator assertion, so it
+  is checked against the reference's own `--backend-id` and a contradiction is
+  refused, exactly as `--pair` is checked against both source arms. A reference
+  that declares no arm is accepted and recorded as `undeclared` under the
+  source `reference_arm_undeclared`, rather than published as an asserted A1
+  nothing verified.
+- With no reference run, a document whose baseline **is** A1 — `--pair
+  m3_ttft` / `m6_noise_floor`, or an unlabelled join whose `run.baseline_id`
+  names A1 — answers from its own cold twin, and the source reads
+  `baseline_arm`.
+- With no reference run on a document whose baseline is not A1, there is no
+  cold answer at all: `propagation_contamination_rate`, its numerator and the
+  scored-only rate are **null**, `propagation_cold_reference_missing` is true,
+  every probe is counted in `propagation_probes_without_cold_reference`, and
+  `propagation_cold_reference_arm` reads `required: A1` — a requirement, not a
+  claim that A1 was consulted. This is read off `--pair` **and** off
+  `run.baseline_id`, which the merge stamps from the cold arm's
+  `--backend-id`: `--pair` is optional, so an A4 vs A6 merge that nobody
+  labelled is still an m7-shaped merge and still gets no rate.
+- **A document that identifies no arm at all gets no rate either**, and that
+  is the default shape: `--backend-id` defaults to the empty string, a plain
+  `merge-results` stamps `run.baseline_id` from the cold **run id**, and a
+  backend id that names a build rather than an arm (`vllm-0.29-span`,
+  `sglang-fuzzy-pr31057`) resolves to no arm. Such a document is
+  indistinguishable from an A4-vs-A6 merge that labelled nothing, so it is
+  suppressed the same way, with `propagation_cold_reference_arm: "undeclared"`
+  distinguishing the two. Publishing M7 takes an **affirmative** A1 signal —
+  `--cold-reference`, `--pair m3_ttft` / `m6_noise_floor`, or a cold arm whose
+  `--backend-id` names A1 — never the mere absence of a contradicting one.
+  Through round 6's second pass this branch still published the number, which
+  is the same 0.0-on-a-contaminated-workload the explicit reference exists to
+  prevent, reachable with default flags and no optional argument at all.
+- A reference that was supplied and **scored no probe at all** — a run of
+  another manifest, an already-merged document whose rows are all stamped
+  `arm='warm'`, or every probe position-mismatched — is the same hole one door
+  over: it would publish `0 / |probe set|` beside
+  `propagation_cold_reference_missing: false`. The rate, its numerator and the
+  scored-only rate are null there too, under
+  `propagation_cold_reference_unusable: true` so it cannot be confused with
+  "no reference was given". `merge-results` refuses such a reference outright
+  when it shares no item with the merged arms.
+
+`propagation_contamination_rate_vs_baseline_arm` is always published: it is the
+same comparison taken against whatever this document calls its baseline. It is
+a useful arm-vs-arm diagnostic and it is deliberately under a distinct name,
+because on an `m7_propagation` document it is exactly the number that
+under-reports.
 
 **The denominator is the probe set.** Section 4 says "A4 vs A6 on the 50
 `propagation_probe` items", and a probe that could not be scored is not
@@ -617,8 +850,8 @@ replace it.
 A propagation probe is a verbatim repeat of an earlier request that was served
 approximate KV, so three answers exist for one prompt: the **served** answer
 (the parent item's answer in the same arm), the **cold** answer (this item's
-own answer in the baseline arm, which is what an uncontaminated engine must
-return), and the treatment answer under test. A probe counts as propagated
+answer in the cold reference arm above, which is what an uncontaminated engine
+must return), and the treatment answer under test. A probe counts as propagated
 when its treatment answer is strictly closer (ROUGE-L) to the served answer
 than to the cold one — strictly, because a tie is not evidence.
 

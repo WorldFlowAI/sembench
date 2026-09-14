@@ -53,6 +53,7 @@ from sembench.results import (
     ALIGNMENT_OPPORTUNITY_CLASSES,
     DENOMINATOR_FROM_MANIFEST,
     DENOMINATOR_FROM_ROWS_PRESENT,
+    NO_REUSE_CLASS,
     PHASE0_ARM_PAIRS,
     PROPAGATION_PROBE_CLASS,
     aggregate_metrics,
@@ -570,14 +571,32 @@ def test_merge_results_records_the_arm_pair_section_four_names(tmp_path, capsys)
         "cold",
         arm="cold",
         backend_id="A3 conn_discovery",
-        rows=[_row("i1", arm="cold", ttft_ms=100.0, audit_joined=None)],
+        # Round 6: the capture leg's population is section 4's "A3 -> A4 delta
+        # on no_reuse items", so the pair that prices it is a no_reuse one.
+        rows=[
+            _row(
+                "i1",
+                arm="cold",
+                ttft_ms=100.0,
+                traffic_class=NO_REUSE_CLASS,
+                audit_joined=None,
+            )
+        ],
     )
     warm = _arm_document(
         tmp_path,
         "warm",
         arm="warm",
         backend_id="A4 conn_span",
-        rows=[_row("i1", arm="warm", ttft_ms=120.0, audit_advertised_tokens=0)],
+        rows=[
+            _row(
+                "i1",
+                arm="warm",
+                ttft_ms=120.0,
+                traffic_class=NO_REUSE_CLASS,
+                audit_advertised_tokens=0,
+            )
+        ],
         class_counts={SAME_DOC: 300, REVISED: 150, PROPAGATION_PROBE_CLASS: 50},
         engine={
             "prometheus": {
@@ -857,6 +876,9 @@ def test_m7_divides_by_the_manifest_probe_set():
     """
     paired = paired_summary(
         _probe_rows(probe_answer="Donaghadee"),
+        # M7 publishes only against an identified cold arm (round 6, second
+        # pass); this test is about the denominator, so it declares one.
+        baseline_arm="A1 stock_pc",
         manifest_class_counts={PROPAGATION_PROBE_CLASS: 50, SAME_DOC: 300},
     )
 
@@ -877,7 +899,9 @@ def test_a_probe_whose_pair_was_not_clean_is_counted_not_dropped():
     as a probe that came back clean."""
     rows = _probe_rows(probe_answer="Donaghadee", probe_kw={"flush_contaminated": True})
 
-    paired = paired_summary(rows, manifest_class_counts={PROPAGATION_PROBE_CLASS: 2})
+    paired = paired_summary(
+        rows, baseline_arm="A1 stock_pc", manifest_class_counts={PROPAGATION_PROBE_CLASS: 2}
+    )
 
     assert paired is not None
     assert paired["propagation_probes_excluded_unclean_pair"] == 1

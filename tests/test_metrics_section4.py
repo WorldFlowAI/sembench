@@ -189,6 +189,9 @@ def test_manifest_expectations_reads_the_real_metadata_keys():
         # manifest facts, so they are stamped by the same function.
         "rope_delta_bucket": None,
         "stream_position": None,
+        # Round 6: M1's shared-wrapper vs ad-hoc strata are a manifest fact too.
+        "wrapper_id": None,
+        "wrapper_rank": None,
     }
 
 
@@ -613,8 +616,14 @@ def _probe_arms(*, probe_answer: str) -> list[RequestMetrics]:
 
 def test_m7_counts_a_probe_answering_like_the_served_output():
     """Section 4: "fraction whose answer in A6 matches the *served* output
-    rather than the *cold* (A1) output"."""
-    paired = paired_summary(_probe_arms(probe_answer="Donaghadee"))
+    rather than the *cold* (A1) output".
+
+    ``baseline_arm`` names A1 because M7 is published only when some run is
+    identified as section 4's cold arm (round 6, second pass: a document that
+    identifies no arm is indistinguishable from an A4-vs-A6 merge that
+    labelled nothing). These tests are about the scoring, so they declare it.
+    """
+    paired = paired_summary(_probe_arms(probe_answer="Donaghadee"), baseline_arm="A1 stock_pc")
 
     assert paired is not None
     assert paired["propagation_contamination_denominator"] == 1
@@ -623,7 +632,9 @@ def test_m7_counts_a_probe_answering_like_the_served_output():
 
 
 def test_m7_does_not_count_a_probe_answering_like_the_cold_arm():
-    paired = paired_summary(_probe_arms(probe_answer="Northern Ireland"))
+    paired = paired_summary(
+        _probe_arms(probe_answer="Northern Ireland"), baseline_arm="A1 stock_pc"
+    )
 
     assert paired is not None
     assert paired["propagation_contamination_numerator"] == 0
@@ -639,8 +650,8 @@ def test_m7_reports_probes_it_could_not_score_instead_of_dropping_them():
         for row in rows
     ]
 
-    no_parent = paired_summary(rows)
-    no_link = paired_summary(unlinked)
+    no_parent = paired_summary(rows, baseline_arm="A1 stock_pc")
+    no_link = paired_summary(unlinked, baseline_arm="A1 stock_pc")
 
     assert no_parent is not None and no_link is not None
     # The parent is not in this arm at all, so there is no served answer.

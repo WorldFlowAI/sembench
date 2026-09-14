@@ -11,3 +11,6 @@ results/
 # Packaging
 sembench.egg-info/
 dist/
+
+# LongBench-v2 dataset cache (downloaded by the phase-0 manifest builder)
+data/longbench-v2/

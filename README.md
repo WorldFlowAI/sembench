@@ -234,6 +234,48 @@ against each arm's `--backend-id` / `--baseline-id`, so an A3-vs-A4 capture leg
 cannot be published as the M3 headline. Arms that did not label themselves are
 merged without complaint; a contradiction is refused.
 
+The pair also decides two populations. On `m4_capture` the miss tax is taken
+over `no_reuse` pairs only, because section 4 defines the capture cost as the
+A3 → A4 delta *on `no_reuse` items*. And on `m7_propagation` the baseline arm
+is A4 — the product arm — which is not section 4's cold reference, so M7 needs
+a third arm:
+
+```bash
+python -m sembench merge-results \
+  --cold results/a4-conn-span.json \
+  --warm results/a6-conn-span-nomitigation.json \
+  --output results/paired-m7.json \
+  --pair m7_propagation \
+  --cold-reference results/a1-stock-pc.json
+```
+
+`--cold-reference` takes an **A1** result and uses its answers as M7's cold
+output, matched by `item_id` and stream position. `--cold-reference-arm`
+(default `A1`) asserts which arm that document is, and the assertion is checked
+against the reference's own `--backend-id`: a contradiction is refused, and a
+reference that declares no arm is recorded as `undeclared` rather than as an
+unverified A1. A reference that shares no item with the merged arms — another
+manifest, or an already-merged document — is refused too, because it would
+score no probe at all. What survives is recorded on the merged document as
+`config.cold_reference_result` / `config.cold_reference_arm` and published as
+`propagation_cold_reference_source` / `propagation_cold_reference_arm`.
+
+Without a reference run, an A4-vs-A6 merge publishes
+`propagation_contamination_rate: null` and
+`propagation_cold_reference_missing: true` rather than comparing two arms that
+can be contaminated together — and that holds whether or not the merge was
+labelled `--pair m7_propagation`, because `run.baseline_id` carries the cold
+arm's `--backend-id` and M7 reads it. Merges whose baseline already *is* A1
+(`m3_ttft`, `m6_noise_floor`, or a join that declares A1) need no reference
+run.
+
+**A merge that identifies no arm gets no rate either.** `--backend-id` defaults
+to empty, so a plain `merge-results` stamps `run.baseline_id` from the cold
+*run id* — and a backend id naming a build (`vllm-0.29-span`) resolves to no
+arm — which is indistinguishable from an unlabelled A4-vs-A6 merge. Such a
+document publishes a null rate with `propagation_cold_reference_arm:
+"undeclared"`; pass `--backend-id`, `--pair`, or `--cold-reference` to get M7.
+
 ## Engine Counters (the external-KV split)
 
 `usage.prompt_tokens_details.cached_tokens` is the local prefix cache **plus**
@@ -309,8 +351,9 @@ which downstream is the same null as an arm that materialized nothing —
 The manifest supplies the other half of the join, stamped onto every row by
 both live runners: `expected_supplied_tokens`, `expected_span_target_start`,
 `traffic_class`, `rope_delta_bucket` (M6's quality split), `stream_position`
-(M3 pairs twins at the same position) and, for a probe, `parent_item_id`. An
-absent key stamps `null`, never `0`.
+(M3 pairs twins at the same position), `wrapper_id` / `wrapper_rank` (M1's
+shared-wrapper vs ad-hoc strata) and, for a probe, `parent_item_id`. An absent
+key stamps `null`, never `0`.
 
 The manifest also supplies the *denominators*. Section 4's class-scoped rates
 count manifest items — 450 opportunity items, 50 propagation probes — not the
@@ -347,7 +390,14 @@ hundred:
   `span_decline_breakdown` counts the three ways a span is declined *after* a
   lookup hit, so a low alignment rate comes with its diagnosis. Beside them,
   `expected_supplied_tokens_agreement_rate` checks the live planner against the
-  offline model.
+  offline model. Section 4 also forbids publishing the blended rate alone, so
+  `alignment_by_wrapper_stratum` splits all three numbers into the
+  **shared-wrapper** stratum (`wrapper_rank <= 1`: the Zipf head the majority
+  of the stream sits on) and the **ad-hoc** stratum (every lower rank), plus an
+  `unstratified` bucket for rows whose manifest named no wrapper.
+  `wrapper_stratum_rule` states the boundary in the document; each stratum
+  carries its own numerators and denominators, and they sum to the blended
+  ones, so the split explains the headline and cannot change it.
 - **M2, token-weighted.** `materialized_reuse_rate` is
   Σ `runtime_materialized` tokens / Σ advertised `token_count`
   (`materialized_reuse_token_rate` is an alias of it). Both sums obey one
@@ -365,7 +415,13 @@ hundred:
   off the outcome; positive is a tax. `miss_tax_pairs`,
   `miss_tax_pairs_without_ttft`, `miss_tax_pairs_advertising_excluded` and
   `miss_tax_pairs_negative_control_excluded` say who was in it,
-  `miss_tax_definition` states the population in the document itself, and
+  `miss_tax_definition` and `miss_tax_population` state the population in the
+  document itself (on an `m4_capture` merge that population is the `no_reuse`
+  pairs, and `miss_tax_pairs_outside_capture_class_excluded` counts what the
+  class filter removed), `miss_tax_source` says whether it could be identified
+  at all — with no connector audit joined to the warm arm, "advertised
+  nothing" is unreadable, so every number in this block is `null` rather than
+  the whole cold-warm delta relabelled as a tax — and
   `miss_tax_ms_median_of_differences` (+ `_ci`) is the paired form of the same
   question. `miss_tax_lookup_ms_per_lookup` is section 4's scheduler-thread
   leg (`miss_tax_lookup_latency_ms_sum` / `miss_tax_lookups_total`) when the
@@ -380,11 +436,18 @@ hundred:
   set** — the manifest's 50 items, not the probes that happened to be
   scoreable — whose treatment answer is closer to the *served* answer (their
   parent item's answer in the same arm) than to the *cold* answer (their own
-  answer in the baseline arm). A probe that could not be scored is not
-  evidence of no contamination, so it stays in the denominator and is named:
-  `propagation_probes_excluded_unclean_pair`,
+  answer in the **A1** reference arm, see `--cold-reference` above). A probe
+  that could not be scored is not evidence of no contamination, so it stays in
+  the denominator and is named: `propagation_probes_excluded_unclean_pair`,
   `propagation_probes_without_served_answer`, `propagation_probes_unlinked`,
-  `propagation_probes_without_answers`, `propagation_probes_absent_from_run`.
+  `propagation_probes_without_answers`,
+  `propagation_probes_without_cold_reference`,
+  `propagation_probes_reference_position_mismatched`,
+  `propagation_probes_absent_from_run`.
+  `propagation_contamination_rate_vs_baseline_arm` is the same comparison
+  against whatever this document calls its baseline — an arm-vs-arm
+  diagnostic, deliberately under its own name, because on an `m7_propagation`
+  document that is the number that under-reports.
   `propagation_contamination_rate_scored_only` (+
   `propagation_contamination_scored_denominator`) is the scored subset under
   its own name — read it to judge the headline, never in place of it. Read

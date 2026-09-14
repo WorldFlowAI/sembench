@@ -24,7 +24,7 @@ from sembench.gateway_live import (
 from sembench.longbench import DEFAULT_LONGBENCH_V1_DATASETS, load_source_records
 from sembench.offline import OfflineConfig, run_offline
 from sembench.prometheus import MetricsWindow, scrape_all
-from sembench.results import PHASE0_ARM_PAIRS, write_result
+from sembench.results import PHASE0_ARM_PAIRS, PROPAGATION_COLD_REFERENCE_ARM, write_result
 from sembench.schema import write_jsonl
 from sembench.sglang_live import (
     LiveSglangConfig,
@@ -462,6 +462,28 @@ def build_parser() -> argparse.ArgumentParser:
         "m4_instrumentation = A5 vs A4, m7_propagation = A4 vs A6). Recorded on the "
         "merged document and checked against each arm's --backend-id/--baseline-id, so "
         "an A3-vs-A5 merge cannot be published as the M3 headline",
+    )
+    merge.add_argument(
+        "--cold-reference",
+        default=None,
+        metavar="RESULT",
+        help="Result JSON for the A1 reference arm, used as M7's cold answer. Section 4 "
+        "compares the treatment answer against the COLD (A1) output, and on an "
+        "m7_propagation merge the baseline arm is A4 — which can be contaminated on the "
+        "same probe. propagation_contamination_rate is published only when some run is "
+        "identified as A1: this flag, --pair m3_ttft/m6_noise_floor, or a cold arm whose "
+        "--backend-id names A1. A merge that identifies no arm (the default, since "
+        "--backend-id defaults to empty) publishes null with "
+        "propagation_cold_reference_missing true and _arm 'undeclared'",
+    )
+    merge.add_argument(
+        "--cold-reference-arm",
+        default=PROPAGATION_COLD_REFERENCE_ARM,
+        help="Which arm --cold-reference holds. Checked against that result's own "
+        "--backend-id and refused on a contradiction; the merged document records the "
+        "arm the reference DECLARES, and a reference that declares none is recorded as "
+        f"undeclared rather than as an asserted {PROPAGATION_COLD_REFERENCE_ARM} "
+        f"(default {PROPAGATION_COLD_REFERENCE_ARM})",
     )
     _add_connector_audit_arg(merge)
 
@@ -1068,6 +1090,9 @@ def cmd_merge_results(args) -> None:
         arm_label_conflicts,
         arm_pair,
         arm_pair_conflicts,
+        cold_reference_arm_conflicts,
+        cold_reference_conflicts,
+        result_backend_arm,
         result_manifest_class_counts,
     )
 
@@ -1076,15 +1101,34 @@ def cmd_merge_results(args) -> None:
         pair = arm_pair(args.pair) if args.pair else None
     except ValueError as exc:
         raise SystemExit(f"merge-results: {exc}") from exc
+    reference_path = getattr(args, "cold_reference", None)
     try:
         cold_payload = json.loads(Path(args.cold).read_text(encoding="utf-8"))
         warm_payload = json.loads(Path(args.warm).read_text(encoding="utf-8"))
+        reference_payload = (
+            json.loads(Path(reference_path).read_text(encoding="utf-8")) if reference_path else None
+        )
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"merge-results: {exc}") from exc
 
     conflicts = arm_label_conflicts(cold_payload, warm_payload)
     if pair is not None:
         conflicts.extend(arm_pair_conflicts(pair, cold_payload, warm_payload))
+    # M7's reference provenance: --cold-reference-arm is an operator assertion
+    # that defaults to A1, so it is checked against the reference document's
+    # own arm, and a reference that can answer none of this merge's items is
+    # refused rather than published as a scored-nothing zero.
+    reference_rows = requests_from_result(reference_payload) if reference_payload else None
+    reference_arm = result_backend_arm(reference_payload) if reference_payload else ""
+    if reference_payload is not None and reference_rows is not None:
+        conflicts.extend(cold_reference_arm_conflicts(reference_payload, args.cold_reference_arm))
+        conflicts.extend(
+            cold_reference_conflicts(
+                reference_rows,
+                requests_from_result(warm_payload),
+                reference_path=str(reference_path),
+            )
+        )
     if conflicts:
         print(
             json.dumps(
@@ -1133,6 +1177,12 @@ def cmd_merge_results(args) -> None:
             "connector_audit_join": audit_join,
             "request_id_echo": _request_id_echo(joined_rows),
             "manifest_class_counts": class_counts,
+            # M7's cold reference: which document answered as A1, and which
+            # arm that document DECLARES — not the flag, which is an assertion
+            # with no evidence. Null means the merged arms answered for
+            # themselves, which section 4 allows only when the baseline IS A1.
+            "cold_reference_result": reference_path,
+            "cold_reference_arm": reference_arm or None,
             # Which of section 4's comparisons this document is, when the
             # operator named one. Null means "an unlabelled cold/warm join".
             "arm_pair": pair.to_dict() if pair is not None else None,
@@ -1144,6 +1194,8 @@ def cmd_merge_results(args) -> None:
         run=merged_run_metadata(cold_payload, warm_payload, run_id=args.run_id),
         engine=warm_engine,
         manifest_class_counts=class_counts,
+        cold_reference=reference_rows,
+        cold_reference_arm=reference_arm or None,
     )
     print(
         json.dumps(

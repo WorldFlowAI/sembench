@@ -164,6 +164,16 @@ class RequestMetrics:
     # reworded_doc). Falls back to `transform` when the manifest carries the
     # class there instead.
     traffic_class: str | None = None
+    # The instruction wrapper the manifest built this item's prompt with, and
+    # its rank in the workload's Zipf popularity order (0 = most popular).
+    # Section 4 (M1): "Do not report a single blended alignment number. Report
+    # it separately for the shared-wrapper stratum and the ad-hoc stratum."
+    # Alignment is a property of the wrapper's token-level tail, so a blended
+    # rate over a Zipf-skewed stream is dominated by whichever wrapper happened
+    # to be popular. Null is "the manifest named no wrapper", which is not
+    # rank 0 -- see `sembench.results.wrapper_stratum_of`.
+    wrapper_id: str | None = None
+    wrapper_rank: int | None = None
     # The RoPE delta bucket the manifest placed this item in (0 / 128 / 512 /
     # 2048 on the `rope_delta_sweep` class, null everywhere else). Section 4
     # (M6): "Report quality per RoPE-delta bucket. A quality result gathered
@@ -313,8 +323,10 @@ def manifest_expectations(item: WorkloadItem) -> dict[str, Any]:
     class of traffic the item is (``traffic_class`` -- M1's opportunity
     denominator and M7's probe set), which earlier item a propagation probe
     repeats (``parent_item_id``), which RoPE-delta bucket M6's quality split is
-    reported over (``rope_delta_bucket``), and where the item sat in the
-    replay order (``stream_position`` -- M3 pairs at the same position).
+    reported over (``rope_delta_bucket``), where the item sat in the replay
+    order (``stream_position`` -- M3 pairs at the same position), and which
+    instruction wrapper built the prompt (``wrapper_id`` / ``wrapper_rank`` --
+    M1's shared-wrapper vs ad-hoc strata).
 
     Absent keys stay None rather than becoming zeros: "the manifest made no
     claim" and "the manifest predicted nothing" are different statements and
@@ -328,6 +340,8 @@ def manifest_expectations(item: WorkloadItem) -> dict[str, Any]:
         "propagation_parent_item_id": _metadata_str(metadata, "parent_item_id"),
         "rope_delta_bucket": _metadata_int(metadata, "rope_delta_bucket"),
         "stream_position": _metadata_int(metadata, "stream_position"),
+        "wrapper_id": _metadata_str(metadata, "wrapper_id"),
+        "wrapper_rank": _metadata_int(metadata, "wrapper_rank"),
     }
 
 
