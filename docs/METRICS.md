@@ -187,6 +187,24 @@ it with a chunk captured off the wire during the E5 GPU run. If the captured
 chunk still parses, the derived shape was right; if it does not, that file was
 the assumption that hid the difference.
 
+`run-live-gateway --metrics-chunk-output PATH` is how the run produces that
+replacement. It writes the FIRST chunk of the first recipient whose `metrics`
+object is a mapping — once per run, never a second time — as
+
+```text
+raw_sse_data   the SSE payload exactly as it arrived (the text after "data: ")
+chunk          that same payload parsed; the key the fixture's readers use
+_captured      run id, pairing arm, base url, request id, capture time
+_provenance    says the file is CAPTURED, and what replacing the fixture costs
+```
+
+The flag is off by default and donor pings are excluded: a donor asks for one
+output token, so its chunk describes a generation phase 0 does not measure.
+Note what the replacement costs, because it is deliberate:
+`tests/test_harness_round3_runner.py` asserts that the committed fixture says
+"DERIVED FROM SOURCE, NOT CAPTURED", and that assertion has to be inverted when
+a captured chunk takes its place.
+
 Client-side `ttft_ms` is the sum of these plus network. Under concurrency it is
 dominated by queue wait, which is a function of offered load rather than of
 cache reuse, so it is not comparable across arms at different widths. The

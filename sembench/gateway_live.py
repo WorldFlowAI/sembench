@@ -14,6 +14,7 @@ from urllib.request import Request, urlopen
 from sembench.dispatch import Stage, StageOutcome, run_stages
 from sembench.engine_metrics import engine_metrics_from_chunk, engine_timing, float_or_none
 from sembench.exact_cache import ExactBlockIndex, full_block_tokens
+from sembench.metrics_chunk import MetricsChunkCapture, capture_for
 from sembench.pairing import COLD_ARM, SINGLE_ARM, ReplayStep, replay_plan
 from sembench.quality import quality_score, rouge_l_best, token_f1
 from sembench.replay_stages import build_stages
@@ -120,6 +121,13 @@ class LiveGatewayConfig:
     # concurrency a manifest gap measured in stream positions means nothing:
     # without this the two can be in flight together.
     min_donor_gap_requests: int = 0
+    # Where to write the run's FIRST streamed chunk that carries a per-request
+    # metrics object, verbatim. Opt-in and off by default: it is the parser
+    # fixture the phase-0 handoff owes (the committed one is derived from vLLM
+    # source, not captured), not something an ordinary arm needs. Recipients
+    # only -- a donor ping asks for one output token and its chunk would say
+    # nothing about a real generation.
+    metrics_chunk_output: str | None = None
 
 
 @dataclass(frozen=True)
@@ -210,6 +218,10 @@ def _replay_dispatched(
     # Written by the donor stage, read by that step's recipient stage, which
     # the dispatcher only releases once the donor stage has completed.
     donor_failures: dict[int, str] = {}
+    # One capture per run, shared by every worker thread; it writes once.
+    metrics_chunk = capture_for(
+        config.metrics_chunk_output, run_id=config.run_id, pairing_arm=config.arm
+    )
     # One engine cache reset per step, fired by whichever of the step's stages
     # runs first. Only reachable at width 1: concurrency with reset_urls is
     # refused above, because a reset mid-flight flushes other requests' KV.
@@ -250,7 +262,12 @@ def _replay_dispatched(
             )
         ):
             return {
-                "response": _recipient_request(item=step.item, config=config, base_url=gateway_base)
+                "response": _recipient_request(
+                    item=step.item,
+                    config=config,
+                    base_url=gateway_base,
+                    metrics_chunk=metrics_chunk,
+                )
             }
 
     report = run_stages(stages, execute=execute, concurrency=concurrency)
@@ -429,6 +446,7 @@ def _recipient_request(
     item: WorkloadItem,
     config: LiveGatewayConfig,
     base_url: str,
+    metrics_chunk: MetricsChunkCapture | None = None,
 ) -> dict[str, Any]:
     return _chat_completion(
         base_url=base_url,
@@ -438,6 +456,10 @@ def _recipient_request(
         tenant=_tenant_for_item(item, config),
         template=_template_for_item(item, config),
         timeout_seconds=config.timeout_seconds,
+        # Passed only when the run asked for a capture, so with the flag off
+        # the call this runner makes is the call it has always made -- which is
+        # what every test double of `_chat_completion` is written against.
+        **({} if metrics_chunk is None else {"metrics_chunk": metrics_chunk}),
     )
 
 
@@ -590,6 +612,7 @@ def _chat_completion(
     tenant: str,
     template: str,
     timeout_seconds: float,
+    metrics_chunk: MetricsChunkCapture | None = None,
 ) -> dict[str, Any]:
     # Set by the runner for the request being issued on this thread. Sent as a
     # header (which vLLM prefers) and as a body field (which survives a front
@@ -649,6 +672,16 @@ def _chat_completion(
                 chunk_metrics = engine_metrics_from_chunk(chunk)
                 if chunk_metrics is not None:
                     metrics = dict(chunk_metrics)
+                    # `text` is the SSE payload as it arrived, before any
+                    # re-encoding: the fixture has to be what the engine sent,
+                    # not what json.dumps would make of what we parsed.
+                    if metrics_chunk is not None:
+                        metrics_chunk.offer(
+                            raw=text,
+                            chunk=chunk,
+                            base_url=base_url,
+                            request_id=request_id,
+                        )
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
                     piece = delta.get("content") or choice.get("text") or ""

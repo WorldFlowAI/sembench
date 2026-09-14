@@ -179,6 +179,15 @@ python -m sembench run-live-gateway \
   Also accepted by `merge-results`. A path that does not exist is refused
   before the arm issues any traffic, because "the audit file was misspelled"
   and "the arm materialized nothing" are otherwise the same null downstream.
+- `--metrics-chunk-output PATH` — write the run's FIRST streamed chunk that
+  carries a per-request `metrics` object to PATH, verbatim: the raw SSE payload
+  exactly as it came off the socket (`raw_sse_data`) beside the parsed object
+  (`chunk`). Off by default. It exists because
+  `tests/fixtures/vllm_0290_stream_chunk.json` is **derived from vLLM source,
+  not captured**, so the parser is checked against what the source says rather
+  than against what a server sends; a captured file is a drop-in replacement
+  for it. Recipients only — a donor ping asks for one output token and its
+  chunk describes a generation nothing here measures.
 
 `--concurrency > 1` is refused together with `--reset-url`, and therefore with
 `--paired`: a cache reset firing mid-flight would flush the KV of requests

@@ -37,6 +37,7 @@ from sembench.manifest_cli import (
     cmd_verify_frozen,
 )
 from sembench.merge import add_merge_parser, cmd_merge_results
+from sembench.metrics_chunk import add_metrics_chunk_arg
 from sembench.offline import OfflineConfig, run_offline
 from sembench.prometheus import MetricsWindow, scrape_all
 from sembench.results import write_result
@@ -331,6 +332,7 @@ def build_parser() -> argparse.ArgumentParser:
         "(vLLM: http://host:8000/reset_prefix_cache?reset_external=true)",
     )
     add_connector_audit_arg(gateway)
+    add_metrics_chunk_arg(gateway)
 
     load = sub.add_parser(
         "run-load",
@@ -558,6 +560,7 @@ def cmd_run_live_gateway(args) -> None:
         reset_urls=tuple(args.reset_urls),
         concurrency=args.concurrency,
         min_donor_gap_requests=args.min_donor_gap_requests,
+        metrics_chunk_output=args.metrics_chunk_output,
     )
     engine_flags = _engine_flags_or_exit(args)
     violations = (
