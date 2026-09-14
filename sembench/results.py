@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import platform
+import re
 import time
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,8 +19,19 @@ from sembench.schema import (
 )
 
 
-def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
-    """Aggregate per-request metrics into benchmark-level rates."""
+def aggregate_metrics(
+    requests: list[RequestMetrics],
+    *,
+    manifest_class_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
+    """Aggregate per-request metrics into benchmark-level rates.
+
+    ``manifest_class_counts`` is the workload's per-traffic-class item count
+    (``sembench.schema.manifest_class_counts``). Section 4's class-scoped
+    denominators — M1's opportunity classes, M7's probe set — are counts of
+    manifest items, so they are taken from it when the runner carried it into
+    the result and from the rows present only when it did not.
+    """
     total_blocks = sum(r.total_blocks for r in requests)
     prompt_tokens = sum(r.prompt_tokens for r in requests)
     exact_blocks = sum(r.exact_hit_blocks for r in requests)
@@ -137,8 +150,48 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
             if quality_values
             else None
         ),
-        **connector_audit_metrics(requests),
+        # M6: "Report quality per RoPE-delta bucket. A quality result gathered
+        # only at |delta| <= 11 does not transfer."
+        "quality_by_rope_delta_bucket": quality_by_rope_delta_bucket(requests),
+        **connector_audit_metrics(requests, manifest_class_counts=manifest_class_counts),
     }
+
+
+def quality_by_rope_delta_bucket(requests: list[RequestMetrics]) -> dict[str, Any] | None:
+    """Answer quality split by the manifest's RoPE-delta bucket.
+
+    Section 4 (M6): "Report quality per RoPE-delta bucket from the
+    rope_delta_sweep class. A quality result gathered only at |delta| <= 11
+    does not transfer." Re-rotating donor KV across a large positional delta is
+    the specific quality risk lane 2 carries, and a blended mean over a stream
+    that is 93% |delta| ~ 0 cannot show it.
+
+    Keys are the bucket as a string, because a result document is JSON. None
+    when no row declares a bucket — the split was not measured, which is not
+    the same as a workload with no positional deltas.
+    """
+    groups: dict[int, list[RequestMetrics]] = {}
+    for row in requests:
+        if row.rope_delta_bucket is None:
+            continue
+        groups.setdefault(int(row.rope_delta_bucket), []).append(row)
+    if not groups:
+        return None
+    summary: dict[str, Any] = {}
+    for bucket, rows in sorted(groups.items()):
+        passes = [row.quality_pass for row in rows if row.quality_pass is not None]
+        summary[str(bucket)] = {
+            "requests": len(rows),
+            "mean_quality_f1": _mean([r.quality_f1 for r in rows if r.quality_f1 is not None]),
+            "mean_quality_rouge_l": _mean(
+                [r.quality_rouge_l for r in rows if r.quality_rouge_l is not None]
+            ),
+            "quality_pass_rate": (
+                _rate(sum(1 for v in passes if v), len(passes)) if passes else None
+            ),
+            "mean_ttft_ms": _mean([r.ttft_ms for r in rows if r.ttft_ms is not None]),
+        }
+    return summary
 
 
 def _pctl(values: list[float], pct: float) -> float | None:
@@ -259,6 +312,26 @@ TRAFFIC_CLASSES = (
 # it cannot be conditioned on the prediction that it would be.
 ALIGNMENT_OPPORTUNITY_CLASSES = (SAME_DOC_NEW_INSTRUCTION_CLASS, REVISED_DOC_CLASS)
 
+# Where a class-scoped denominator came from. Section 4's denominators are
+# counts of MANIFEST ITEMS, so a run that lost rows (errors, a stopped run, a
+# --max-items cut) must still divide by what it was asked to serve. When the
+# manifest counts did not reach the result document the rows present are used
+# instead, and the substitution is named rather than assumed.
+DENOMINATOR_FROM_MANIFEST = "manifest"
+DENOMINATOR_FROM_ROWS_PRESENT = "rows_present"
+
+
+def manifest_class_total(counts: dict[str, int] | None, classes: Sequence[str]) -> int | None:
+    """How many manifest items fall in ``classes``, or None with no counts.
+
+    None means "the manifest's own count never reached this document", which
+    is the only honest reason to fall back to the rows that happen to be
+    present.
+    """
+    if not counts:
+        return None
+    return sum(int(counts.get(name, 0)) for name in classes)
+
 
 def traffic_class_of(row: RequestMetrics) -> str:
     """The row's traffic class, falling back to ``transform``.
@@ -330,11 +403,60 @@ def auditable_rows(rows: list[RequestMetrics]) -> AuditableRows:
     return AuditableRows(tuple(considered), cold, unjoined)
 
 
-def _m1_alignment(considered: list[RequestMetrics], *, joined: bool) -> dict[str, Any]:
+def _m1_breakdowns(
+    considered: list[RequestMetrics],
+) -> tuple[dict[str, int], dict[str, int]]:
+    """M1's two diagnoses: why misses missed, and how spans were declined.
+
+    Together they account for every lookup hit that was not served — a miss
+    that reached the boundary-missed branch carries a partition reason, and
+    one declined earlier (unaligned boundary, below the minimum after a clamp)
+    carries only its event name, which is its cause.
+    """
+    miss_breakdown: dict[str, int] = {}
+    decline_breakdown: dict[str, int] = {}
+    for row in considered:
+        if row.audit_boundary_miss_reason and (row.audit_boundary_missed_at or 0) > 0:
+            reason = row.audit_boundary_miss_reason
+            miss_breakdown[reason] = miss_breakdown.get(reason, 0) + 1
+        if row.audit_span_decline_event:
+            event = row.audit_span_decline_event
+            decline_breakdown[event] = decline_breakdown.get(event, 0) + 1
+    return (
+        dict(sorted(miss_breakdown.items())),
+        dict(sorted(decline_breakdown.items())),
+    )
+
+
+def _m1_alignment(
+    considered: list[RequestMetrics],
+    *,
+    joined: bool,
+    manifest_class_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """M1: the three alignment numbers, plus the offline-model integrity check.
 
     Deduped by request id by construction: one row is one request, and the
     audit fold already collapsed a re-queried request's repeated attempts.
+
+    Section 4 shares ONE numerator between the two rates, and that is what is
+    published here: ``alignment_given_match_numerator`` and
+    ``alignment_given_opportunity_numerator`` are the same count of advertises.
+    The shared numerator is not restricted to the two opportunity classes, so
+    the opportunity rate CAN exceed 1.0 — a ``rope_delta_sweep`` or
+    ``exact_repeat`` item carries a donor and advertises too. Restricting the
+    numerator silently would make the rate look like a fraction while
+    answering a question section 4 did not ask, so the excess is named instead:
+    ``alignment_given_opportunity_numerator_outside_classes`` is exactly how
+    many of the advertises came from outside the denominator's population, and
+    a rate above 1.0 is read against it.
+
+    The opportunity denominator is the MANIFEST's per-class item count when the
+    result document carries it. A run that errored on half its opportunity
+    items, or was cut short by ``--max-items``, otherwise divides by the rows
+    that survived and turns its own losses into a better score. The rows-present
+    figure is published beside it under
+    ``alignment_given_opportunity_rows_present``.
     """
     advertised_at_boundary = [
         row
@@ -346,36 +468,47 @@ def _m1_alignment(considered: list[RequestMetrics], *, joined: bool) -> dict[str
         for row in considered
         if row.audit_semantic_lookup_hit and (row.audit_lookup_hit_boundary or 0) > 0
     ]
-    opportunity = [
+    opportunity_rows = [
         row for row in considered if traffic_class_of(row) in ALIGNMENT_OPPORTUNITY_CLASSES
     ]
     aligned = len(advertised_at_boundary)
-    # One deliberate deviation. Section 4 shares ONE numerator between the two
-    # rates, which holds only if every advertise comes from an item in the
-    # opportunity classes -- and it does not, since rope_delta_sweep items
-    # carry donors and advertise too. A shared numerator over a two-class
-    # denominator can exceed 1.0 and stop being a fraction, so each rate is
-    # counted over its own denominator's population. The gap between the two
-    # numerators is itself the count of advertises won outside the two classes.
-    aligned_opportunity = sum(
+    outside_classes = sum(
         1
         for row in advertised_at_boundary
-        if traffic_class_of(row) in ALIGNMENT_OPPORTUNITY_CLASSES
+        if traffic_class_of(row) not in ALIGNMENT_OPPORTUNITY_CLASSES
     )
-    miss_breakdown: dict[str, int] = {}
-    for row in considered:
-        if row.audit_boundary_miss_reason and (row.audit_boundary_missed_at or 0) > 0:
-            reason = row.audit_boundary_miss_reason
-            miss_breakdown[reason] = miss_breakdown.get(reason, 0) + 1
-    opportunity_rate = _rate_or_none(aligned_opportunity, len(opportunity)) if joined else None
+    manifest_denominator = manifest_class_total(
+        manifest_class_counts, ALIGNMENT_OPPORTUNITY_CLASSES
+    )
+    denominator = len(opportunity_rows) if manifest_denominator is None else manifest_denominator
+    denominator_source = (
+        DENOMINATOR_FROM_ROWS_PRESENT if manifest_denominator is None else DENOMINATOR_FROM_MANIFEST
+    )
+    miss_breakdown, decline_breakdown = _m1_breakdowns(considered)
+    opportunity_rate = _rate_or_none(aligned, denominator) if joined else None
     return {
         "alignment_given_match": _rate_or_none(aligned, len(lookup_hits)) if joined else None,
         "alignment_given_match_numerator": aligned if joined else None,
         "alignment_given_match_denominator": len(lookup_hits),
         "alignment_given_opportunity": opportunity_rate,
-        "alignment_given_opportunity_numerator": aligned_opportunity if joined else None,
-        "alignment_given_opportunity_denominator": len(opportunity),
-        "boundary_miss_breakdown": dict(sorted(miss_breakdown.items())) if joined else None,
+        # Section 4's shared numerator: the same count as the match rate's.
+        "alignment_given_opportunity_numerator": aligned if joined else None,
+        "alignment_given_opportunity_numerator_outside_classes": (
+            outside_classes if joined else None
+        ),
+        "alignment_given_opportunity_denominator": denominator,
+        "alignment_given_opportunity_denominator_source": denominator_source,
+        # The same numerator over the opportunity rows this document actually
+        # holds, so a truncated run is visible as the gap between the two.
+        "alignment_given_opportunity_rows_present": (
+            _rate_or_none(aligned, len(opportunity_rows)) if joined else None
+        ),
+        "alignment_given_opportunity_rows_present_denominator": len(opportunity_rows),
+        "boundary_miss_breakdown": miss_breakdown if joined else None,
+        # The three ways a span is declined AFTER a lookup hit. A misalignment
+        # that never reached the boundary-missed branch lands here, and the two
+        # breakdowns together account for every hit that was not served.
+        "span_decline_breakdown": decline_breakdown if joined else None,
         # The headline alias. The same number as alignment_given_opportunity,
         # kept because it is the name every earlier result document used.
         "boundary_alignment_rate": opportunity_rate,
@@ -425,13 +558,24 @@ def _m1_integrity_check(considered: list[RequestMetrics], *, joined: bool) -> di
 
 
 def _m2_materialized_reuse(considered: list[RequestMetrics], *, joined: bool) -> dict[str, Any]:
-    """M2: the token-weighted headline, and the request-count rate beside it."""
+    """M2: the token-weighted headline, and the request-count rate beside it.
+
+    Both sums obey the audit fold's single rule — the last advertise, and the
+    materializations that followed it (see :func:`sembench.connector_audit._fold`).
+    Mass the worker wrote against a promise the scheduler had already
+    superseded is summed separately into
+    ``materialized_reuse_superseded_tokens``: counting it in the numerator over
+    a denominator that holds only the last promise is how a ratio climbs past
+    1.0 without any extra KV being reused.
+    """
     advertised = [row for row in considered if row.audit_advertised_tokens is not None]
     materialized_rows = [row for row in advertised if row.audit_materialized]
     advertised_tokens = sum(row.audit_advertised_tokens or 0 for row in advertised)
     materialized_tokens = sum(row.external_confirmed_tokens or 0 for row in materialized_rows)
+    superseded_tokens = sum(row.audit_superseded_materialized_tokens or 0 for row in considered)
     token_rate = _rate_or_none(materialized_tokens, advertised_tokens) if joined else None
     return {
+        "materialized_reuse_superseded_tokens": superseded_tokens if joined else None,
         # Section 4's formula, and therefore the headline.
         "materialized_reuse_rate": token_rate,
         "materialized_reuse_tokens": materialized_tokens if joined else None,
@@ -478,7 +622,11 @@ def _m7_inputs(considered: list[RequestMetrics], *, joined: bool) -> dict[str, A
     }
 
 
-def connector_audit_metrics(rows: list[RequestMetrics]) -> dict[str, Any]:
+def connector_audit_metrics(
+    rows: list[RequestMetrics],
+    *,
+    manifest_class_counts: dict[str, int] | None = None,
+) -> dict[str, Any]:
     """M1 boundary alignment and M2 materialized reuse, per section 4.
 
     Every rate here is computed over :func:`auditable_rows` only — never over
@@ -497,15 +645,16 @@ def connector_audit_metrics(rows: list[RequestMetrics]) -> dict[str, Any]:
 
         boundary_miss_breakdown      = boundary_missed events partitioned by reason
 
-    The two rates differ in what they are conditioned on (and therefore, see
-    :func:`_m1_alignment`, in the population their shared numerator is counted
-    over): ``alignment_given_match`` asks "when the provider found a donor,
-    did the engine's boundary land on a span?", which is the property of the
-    *tokenizer and the template* that caveat A of the plan is about;
+    The two rates share one numerator and differ only in what they are
+    conditioned on: ``alignment_given_match`` asks "when the provider found a
+    donor, did the engine's boundary land on a span?", which is the property of
+    the *tokenizer and the template* that caveat A of the plan is about;
     ``alignment_given_opportunity`` asks "of the traffic that should have been
     reusable, how much was served?", which is the product number and therefore
     the headline — ``boundary_alignment_rate`` is kept as its alias and
-    nothing else.
+    nothing else. Its denominator is the manifest's per-class item count when
+    the document carries one (``manifest_class_counts``), because section 4
+    counts manifest items, not surviving rows.
 
     Beside them, M1's integrity check: does the connector's advertised
     ``token_count`` match the offline model's ``expected_supplied_tokens``,
@@ -545,7 +694,11 @@ def connector_audit_metrics(rows: list[RequestMetrics]) -> dict[str, Any]:
         "connector_audit_rows_considered": len(considered),
         "connector_audit_rows_excluded_cold_arm": auditable.excluded_cold_arm,
         "connector_audit_rows_excluded_not_joined": auditable.excluded_not_joined,
-        **_m1_alignment(considered, joined=joined),
+        # The workload the class-scoped denominators come from, so a reader
+        # can check a denominator instead of trusting it. Null when the run
+        # did not carry the manifest's counts into its result.
+        "manifest_class_counts": dict(manifest_class_counts) if manifest_class_counts else None,
+        **_m1_alignment(considered, joined=joined, manifest_class_counts=manifest_class_counts),
         **_m2_materialized_reuse(considered, joined=joined),
         **_m7_inputs(considered, joined=joined),
     }
@@ -584,30 +737,77 @@ class _Pair:
     warm: RequestMetrics
 
 
+@dataclass(frozen=True)
+class _PairSet:
+    """The usable pairs, and every candidate that did not become one.
+
+    ``excluded`` holds the cold row of each dropped candidate so a class-scoped
+    denominator (M7's probe set) can say how many of ITS items were lost, not
+    just how many were lost overall.
+    """
+
+    pairs: tuple[_Pair, ...]
+    contaminated: int
+    errored: int
+    unpaired: int
+    stream_position_mismatched: int
+    excluded: tuple[RequestMetrics, ...]
+
+
 def _clean_pairs(
     cold: dict[str, RequestMetrics],
     warm: dict[str, RequestMetrics],
-) -> tuple[list[_Pair], int, int]:
+) -> _PairSet:
     """Pairs whose cold twin was genuinely cold and whose arms both answered.
 
-    Returns the usable pairs plus the counts it removed, so the summary can
+    Returns the usable pairs plus everything it removed, so the summary can
     report what it dropped instead of shrinking a denominator in silence.
+
+    One check is new in round 5. Section 4 states M3 as "per ``item_id``, at
+    the same stream position", and an item's manifest stream position is
+    stamped on both twins. Two twins at different positions did not replay the
+    same stream — a re-ordered or edited manifest between the arms, which the
+    ``manifest_sha256`` check in ``merge-results`` catches only when both arms
+    recorded one — and their TTFT ratio measures the reorder, not the cache.
+    A row that declares no position makes no claim and is not excluded by it.
     """
     pairs: list[_Pair] = []
+    excluded: list[RequestMetrics] = []
     contaminated = 0
     errored = 0
+    unpaired = 0
+    position_mismatched = 0
     for item_id, cold_row in cold.items():
         warm_row = warm.get(item_id)
         if warm_row is None:
+            unpaired += 1
+            excluded.append(cold_row)
             continue
         if cold_row.flush_contaminated:
             contaminated += 1
+            excluded.append(cold_row)
             continue
         if cold_row.error or warm_row.error:
             errored += 1
+            excluded.append(cold_row)
+            continue
+        if (
+            cold_row.stream_position is not None
+            and warm_row.stream_position is not None
+            and cold_row.stream_position != warm_row.stream_position
+        ):
+            position_mismatched += 1
+            excluded.append(cold_row)
             continue
         pairs.append(_Pair(item_id, cold_row, warm_row))
-    return pairs, contaminated, errored
+    return _PairSet(
+        pairs=tuple(pairs),
+        contaminated=contaminated,
+        errored=errored,
+        unpaired=unpaired,
+        stream_position_mismatched=position_mismatched,
+        excluded=tuple(excluded),
+    )
 
 
 def _hit_accounting(warm_rows: list[RequestMetrics]) -> dict[str, Any]:
@@ -680,6 +880,9 @@ def _kl_summary(pairs: list[_Pair]) -> dict[str, Any]:
 def _propagation_summary(
     pairs: list[_Pair],
     warm_by_item: dict[str, RequestMetrics],
+    *,
+    excluded: Sequence[RequestMetrics] = (),
+    manifest_class_counts: dict[str, int] | None = None,
 ) -> dict[str, Any]:
     """M7 — contamination / propagation, as section 4 defines it.
 
@@ -701,14 +904,30 @@ def _propagation_summary(
     (ROUGE-L) to the served answer than to the cold one. Strictly: a tie is
     not evidence, and contamination is a claim that has to be earned.
 
-    Every probe that cannot be scored is counted and named rather than
-    dropped — an unlinked probe, a parent with no answer in this arm, a probe
-    missing either answer — because M7's denominator is 50 items by design and
-    a silently shrunken one reads as a clean result.
+    **The denominator is the probe set, not the probes that could be scored.**
+    Section 4 says "A4 vs A6 on the 50 ``propagation_probe`` items", and a
+    probe that could not be scored is not evidence of no contamination — it is
+    a probe that was not read. Dividing by the scored subset turns every
+    failure to score into a better contamination number, which is the exact
+    direction a contamination metric must not drift. So the headline rate is
+    ``propagated / |manifest propagation_probe items|`` and every exclusion is
+    published beside it: probes whose pair was not clean
+    (``propagation_probes_excluded_unclean_pair`` — no twin, a contaminated
+    cold arm, an error, a stream-position mismatch), unlinked probes, probes
+    whose parent never answered in this arm, and probes missing an answer.
+    The scored-only rate is kept under
+    ``propagation_contamination_rate_scored_only``, which is the number to
+    read when the exclusions are large, and never the headline.
     """
     from sembench.quality import rouge_l
 
     probes = [pair for pair in pairs if traffic_class_of(pair.warm) == PROPAGATION_PROBE_CLASS]
+    excluded_probes = sum(1 for row in excluded if traffic_class_of(row) == PROPAGATION_PROBE_CLASS)
+    manifest_probes = manifest_class_total(manifest_class_counts, (PROPAGATION_PROBE_CLASS,))
+    probe_set = len(probes) + excluded_probes if manifest_probes is None else manifest_probes
+    probe_set_source = (
+        DENOMINATOR_FROM_ROWS_PRESENT if manifest_probes is None else DENOMINATOR_FROM_MANIFEST
+    )
     scored = 0
     propagated = 0
     unlinked = 0
@@ -733,17 +952,141 @@ def _propagation_summary(
             propagated += 1
     return {
         "propagation_definition": (
-            "share of propagation_probe items whose treatment-arm answer is closer to the "
+            "share of the propagation_probe SET whose treatment-arm answer is closer to the "
             "parent item's answer in the same arm (the served output) than to its own "
-            "answer in the baseline arm (the cold output)"
+            "answer in the baseline arm (the cold output); probes that could not be scored "
+            "stay in the denominator and are published as the exclusion counters beside it"
         ),
-        "propagation_contamination_rate": _rate_or_none(propagated, scored),
+        "propagation_contamination_rate": _rate_or_none(propagated, probe_set),
         "propagation_contamination_numerator": propagated,
-        "propagation_contamination_denominator": scored,
+        "propagation_contamination_denominator": probe_set,
+        "propagation_probe_set_source": probe_set_source,
+        # The same numerator over the probes that could actually be read. Use
+        # it to judge the headline, never in place of it.
+        "propagation_contamination_rate_scored_only": _rate_or_none(propagated, scored),
+        "propagation_contamination_scored_denominator": scored,
         "propagation_probe_pairs": len(probes),
+        "propagation_probes_excluded_unclean_pair": excluded_probes,
         "propagation_probes_unlinked": unlinked,
         "propagation_probes_without_served_answer": without_served_answer,
         "propagation_probes_without_answers": without_answers,
+        # Probes the manifest declares that this document holds no row for at
+        # all: a run stopped early, or a --max-items cut. Non-zero means the
+        # probe set was never fully replayed.
+        "propagation_probes_absent_from_run": max(
+            0,
+            probe_set - len(probes) - excluded_probes,
+        ),
+    }
+
+
+# The connector's own lookup counters, named by section 4's M4 decomposition
+# ("scheduler-thread lookup: stats_snapshot().lookup_latency_ms_sum /
+# lookups_total"). They are read out of the arm's engine counter window when
+# that window carries them, and reported as null when it does not — stock
+# vLLM's /metrics exposes neither, so on a stock arm the lookup leg of the
+# decomposition is unmeasured rather than zero.
+LOOKUP_LATENCY_SUM_KEY = "lookup_latency_ms_sum"
+LOOKUPS_TOTAL_KEY = "lookups_total"
+
+
+def _window_counter(delta: dict[str, Any], key: str) -> float | None:
+    """One counter out of an engine window delta, by name or ``<name>_delta``."""
+    for candidate in (f"{key}_delta", key):
+        value = delta.get(candidate)
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            return float(value)
+    return None
+
+
+def lookup_cost_from_engine(engine: dict[str, Any] | None) -> dict[str, Any]:
+    """M4's scheduler-thread lookup leg, from the arm's engine counter window.
+
+    Section 4 decomposes the miss tax into a lookup cost, a capture cost and
+    an instrumentation cost. Only the first is a per-arm counter ratio, and it
+    is only available when the connector exports ``lookup_latency_ms_sum`` and
+    ``lookups_total`` onto the endpoint the run scraped. When it does not, the
+    three keys are null and ``miss_tax_lookup_cost_source`` says so, because a
+    lookup cost of 0.0 would subtract a cost that was never measured.
+    """
+    window = ((engine or {}).get("prometheus") or {}).get("delta") or {}
+    latency_sum = _window_counter(window, LOOKUP_LATENCY_SUM_KEY) if window else None
+    lookups = _window_counter(window, LOOKUPS_TOTAL_KEY) if window else None
+    measured = latency_sum is not None and lookups is not None and lookups > 0
+    return {
+        "miss_tax_lookup_latency_ms_sum": latency_sum,
+        "miss_tax_lookups_total": lookups,
+        "miss_tax_lookup_ms_per_lookup": (latency_sum / lookups) if measured else None,
+        "miss_tax_lookup_cost_source": "engine_window" if measured else None,
+    }
+
+
+def _miss_tax_summary(
+    pairs: list[_Pair],
+    *,
+    engine: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """M4 — the miss tax, as section 4 defines it.
+
+    Section 4, verbatim::
+
+        median ttft_ms(A4 | supplied == 0) - median ttft_ms(A1)
+        over the same item_ids
+
+    "Supplied == 0" is read off the audit, not off the outcome: a pair counts
+    when its warm row advertised nothing — ``audit_advertised_tokens`` is null
+    (the connector said nothing about it) or 0 (it looked and supplied
+    nothing). A row that advertised and then failed to materialize is NOT in
+    this population: it was served a promise, and its latency carries the cost
+    of keeping or breaking that promise rather than the cost of the miss.
+
+    The sign is a tax, not a speedup: positive means the warm arm was slower
+    on requests it could not serve, which is the number the connector has to
+    pay for out of its wins. Negative controls are excluded for the same
+    reason they are excluded from the blended speedup — they are constructed
+    not to reuse, and folding them in would price the connector's miss path
+    on traffic that was never a candidate.
+
+    Section 4's other two legs are cross-ARM deltas (A3 -> A4 for capture,
+    A4 -> A5 for instrumentation) and cannot be computed inside one paired
+    document; ``sembench merge-results --pair`` names those pairs, and the
+    resulting document's ``miss_tax_ms`` is the leg it measured.
+    """
+    from sembench.stats import bootstrap_median
+
+    candidates = [pair for pair in pairs if not pair.cold.negative_control]
+    controls_excluded = len(pairs) - len(candidates)
+    missed = [pair for pair in candidates if (pair.warm.audit_advertised_tokens or 0) == 0]
+    advertising = len(candidates) - len(missed)
+    timed = [pair for pair in missed if pair.cold.ttft_ms and pair.warm.ttft_ms]
+    warm_ttfts = [pair.warm.ttft_ms for pair in timed]
+    cold_ttfts = [pair.cold.ttft_ms for pair in timed]
+    warm_median = _pctl(warm_ttfts, 50)
+    cold_median = _pctl(cold_ttfts, 50)
+    # A per-pair difference CI, because the two medians are over the same
+    # item ids and resampling them independently would widen the interval with
+    # variance the pairing already removed.
+    difference_ci = bootstrap_median([pair.warm.ttft_ms - pair.cold.ttft_ms for pair in timed])
+    return {
+        "miss_tax_definition": (
+            "median warm TTFT minus median cold TTFT over pairs whose warm row advertised "
+            "nothing (audit_advertised_tokens null or 0); positive is a tax the connector "
+            "charges on requests it could not serve"
+        ),
+        "miss_tax_ms": (
+            None if warm_median is None or cold_median is None else warm_median - cold_median
+        ),
+        "miss_tax_ms_median_of_differences": difference_ci.point if difference_ci else None,
+        "miss_tax_ms_median_of_differences_ci": (
+            difference_ci.to_dict() if difference_ci else None
+        ),
+        "miss_tax_warm_ttft_p50_ms": warm_median,
+        "miss_tax_cold_ttft_p50_ms": cold_median,
+        "miss_tax_pairs": len(timed),
+        "miss_tax_pairs_without_ttft": len(missed) - len(timed),
+        "miss_tax_pairs_advertising_excluded": advertising,
+        "miss_tax_pairs_negative_control_excluded": controls_excluded,
+        **lookup_cost_from_engine(engine),
     }
 
 
@@ -781,7 +1124,12 @@ def _engine_ttft_summary(pairs: list[_Pair]) -> dict[str, Any]:
     }
 
 
-def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
+def paired_summary(
+    requests: list[RequestMetrics],
+    *,
+    manifest_class_counts: dict[str, int] | None = None,
+    engine: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     """Per-item cold/warm pairing: TTFT speedups and warm-vs-cold output
     similarity. Pairs with a contaminated cold arm are excluded and counted.
 
@@ -803,6 +1151,12 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     This block is also where M7 lives (:func:`_propagation_summary`): it is a
     comparison between the two arms' answers and cannot be computed from one
     arm's rows, which is why the per-arm audit metrics carry only its inputs.
+    M4 (:func:`_miss_tax_summary`) is here for the same reason — it is a
+    difference between the arms over the pairs the warm arm could not serve.
+
+    ``manifest_class_counts`` supplies section 4's class-scoped denominators
+    (M1's opportunity classes, M7's probe set); ``engine`` is the warm arm's
+    engine block, read only for M4's per-lookup cost.
     """
     cold = {r.item_id: r for r in requests if r.arm == "cold"}
     warm = {r.item_id: r for r in requests if r.arm == "warm"}
@@ -813,7 +1167,8 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     from sembench.quality import rouge_l
     from sembench.stats import bootstrap_mean, bootstrap_median, bootstrap_median_ratio
 
-    pairs, contaminated, errored = _clean_pairs(cold, warm)
+    pair_set = _clean_pairs(cold, warm)
+    pairs = list(pair_set.pairs)
     timed = [p for p in pairs if p.cold.ttft_ms and p.warm.ttft_ms]
     blended = [p for p in timed if not p.cold.negative_control]
     controls = [p for p in timed if p.cold.negative_control]
@@ -866,8 +1221,13 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
         "external_confirmed_is_per_request": external_tokens_are_per_request(warm_rows),
         "pairs_total": len(cold),
         "pairs_used": len(timed),
-        "pairs_contaminated": contaminated,
-        "pairs_errored": errored,
+        "pairs_contaminated": pair_set.contaminated,
+        "pairs_errored": pair_set.errored,
+        "pairs_unpaired": pair_set.unpaired,
+        # Twins the two arms replayed at different manifest stream positions:
+        # they did not replay the same stream, so their ratio is not a
+        # measurement of the cache (section 4's M3 pairs at the same position).
+        "pairs_stream_position_mismatched": pair_set.stream_position_mismatched,
         "ttft_cold_p50_ms": _pctl(cold_ttfts, 50),
         "ttft_cold_p95_ms": _pctl(cold_ttfts, 95),
         "ttft_warm_p50_ms": _pctl(warm_ttfts, 50),
@@ -904,10 +1264,16 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
         # Audit-joined metrics are the warm (connector) arm's: the cold arm
         # runs without a connector and has no audit stream to join, and
         # connector_audit_metrics drops any cold row it is handed anyway.
-        **connector_audit_metrics(warm_rows),
+        **connector_audit_metrics(warm_rows, manifest_class_counts=manifest_class_counts),
         # M7 needs both arms and the warm arm's other rows: see
         # _propagation_summary.
-        **_propagation_summary(pairs, warm),
+        **_propagation_summary(
+            pairs,
+            warm,
+            excluded=pair_set.excluded,
+            manifest_class_counts=manifest_class_counts,
+        ),
+        **_miss_tax_summary(pairs, engine=engine),
         **_kl_summary(pairs),
         **_engine_ttft_summary(pairs),
         # Back-compat alias for the pre-P3 field name.
@@ -923,6 +1289,165 @@ def result_arm(payload: dict[str, Any]) -> str:
     """
     run = payload.get("run") or {}
     return str(run.get("arm") or "")
+
+
+@dataclass(frozen=True)
+class Arm:
+    """One arm of the phase-0 matrix (section 3's arm table)."""
+
+    arm_id: str
+    label: str
+    purpose: str
+
+    def names(self) -> tuple[str, ...]:
+        return (self.arm_id, self.label)
+
+
+PHASE0_ARMS = {
+    arm.arm_id: arm
+    for arm in (
+        Arm(
+            "A0",
+            "stock_nopc",
+            "prefix caching off, no connector — the cold floor, never a baseline",
+        ),
+        Arm("A1", "stock_pc", "prefix caching on, no connector — THE baseline"),
+        Arm("A2", "stock_pc_rerun", "identical repeat of A1 — the cold-vs-cold noise floor"),
+        Arm("A3", "conn_discovery", "mode=discovery_only — lookup cost without capture"),
+        Arm("A4", "conn_span", "mode=semantic_span_experimental — the product arm"),
+        Arm(
+            "A5",
+            "conn_span_noaudit",
+            "A4 with audit and log_decisions off — prices instrumentation",
+        ),
+        Arm("A6", "conn_span_nomitigation", "A4 with contamination eviction off"),
+        Arm("A7", "fleet_3worker", "A4 x 3 replicas behind the llm-d scorer"),
+    )
+}
+
+
+@dataclass(frozen=True)
+class ArmPair:
+    """A comparison section 4 names, and which metric it is the input to."""
+
+    name: str
+    baseline: str
+    treatment: str
+    metric: str
+    measures: str
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "pair": self.name,
+            "metric": self.metric,
+            "measures": self.measures,
+            "baseline_arm": self.baseline,
+            "baseline_arm_label": PHASE0_ARMS[self.baseline].label,
+            "treatment_arm": self.treatment,
+            "treatment_arm_label": PHASE0_ARMS[self.treatment].label,
+        }
+
+
+# Every cold/warm join section 4 asks for by name. `merge-results --pair`
+# takes one of these, records it on the merged document, and checks the two
+# source arms against it — so a merged A3-vs-A5 document cannot be published
+# as if it were the M3 headline.
+PHASE0_ARM_PAIRS = {
+    pair.name: pair
+    for pair in (
+        ArmPair(
+            "m3_ttft",
+            "A1",
+            "A4",
+            "M3",
+            "TTFT speedup and M6 answer quality: the product arm against THE baseline",
+        ),
+        ArmPair(
+            "m6_noise_floor",
+            "A1",
+            "A2",
+            "M6",
+            "cold-vs-cold noise floor; the non-inferiority margin M6 is judged against",
+        ),
+        ArmPair(
+            "m4_capture",
+            "A3",
+            "A4",
+            "M4",
+            "capture leg of the miss tax: discovery-only against the product arm",
+        ),
+        ArmPair(
+            "m4_instrumentation",
+            "A5",
+            "A4",
+            "M4",
+            "instrumentation leg: the audit-off arm against the product arm; "
+            "subtract it from any published tax",
+        ),
+        ArmPair(
+            "m7_propagation",
+            "A4",
+            "A6",
+            "M7",
+            "contamination: the product arm against the same arm with eviction off",
+        ),
+    )
+}
+
+
+def arm_pair(name: str) -> ArmPair:
+    """One of section 4's named arm pairs, or a ValueError listing them all."""
+    pair = PHASE0_ARM_PAIRS.get(str(name))
+    if pair is None:
+        known = ", ".join(sorted(PHASE0_ARM_PAIRS))
+        raise ValueError(f"unknown arm pair {name!r}; section 4 names: {known}")
+    return pair
+
+
+def _declared_arm_id(payload: dict[str, Any], role: str) -> str:
+    """What a result document calls the arm it ran, '' when it says nothing."""
+    run = payload.get("run") or {}
+    for key in ("backend_id", "baseline_id") if role == "cold" else ("backend_id",):
+        value = str(run.get(key) or "").strip()
+        if value:
+            return value
+    return ""
+
+
+def arm_pair_conflicts(
+    pair: ArmPair,
+    cold_payload: dict[str, Any],
+    warm_payload: dict[str, Any],
+) -> list[str]:
+    """Ways the two result documents contradict the pair they are merged as.
+
+    The check is on ``run.backend_id`` (``baseline_id`` for the cold side),
+    which is the only place an operator writes down *which* phase-0 arm a run
+    was. An arm that labelled itself is checked; one that did not is left
+    alone, because refusing an unlabelled run would just teach people to pass
+    ``--pair`` less. Matching is on either spelling — the arm id (``A4``) or
+    the plan's config name (``conn_span``).
+    """
+    conflicts: list[str] = []
+    for role, payload, expected in (
+        ("cold", cold_payload, pair.baseline),
+        ("warm", warm_payload, pair.treatment),
+    ):
+        declared = _declared_arm_id(payload, role)
+        if not declared:
+            continue
+        names = PHASE0_ARMS[expected].names()
+        haystack = declared.lower()
+        if not any(
+            re.search(rf"(?<![a-z0-9]){name.lower()}(?![a-z0-9])", haystack) for name in names
+        ):
+            conflicts.append(
+                f"--pair {pair.name} expects the {role} arm to be {expected} "
+                f"({PHASE0_ARMS[expected].label}), but that result declares "
+                f"{declared!r}: merging it under this pair would publish "
+                f"{pair.metric} against an arm it was not measured on"
+            )
+    return conflicts
 
 
 def arm_label_conflicts(
@@ -963,6 +1488,27 @@ def aggregate_by_transform(requests: list[RequestMetrics]) -> dict[str, dict[str
     return {name: aggregate_metrics(group) for name, group in sorted(groups.items())}
 
 
+def result_manifest_class_counts(payload: dict[str, Any]) -> dict[str, int] | None:
+    """The manifest's per-class item counts a result document carries.
+
+    Written by the runner into ``config.manifest_class_counts`` because the
+    runner is the only stage that reads the manifest. ``merge-results`` reads
+    it back out so the merged document's class-scoped denominators (M1's
+    opportunity classes, M7's probe set) are still the manifest's counts and
+    not the rows the two arms happened to produce.
+    """
+    config = payload.get("config") or {}
+    counts = config.get("manifest_class_counts")
+    if not isinstance(counts, dict):
+        return None
+    clean = {
+        str(name): int(value)
+        for name, value in counts.items()
+        if isinstance(value, int) and not isinstance(value, bool)
+    }
+    return clean or None
+
+
 def write_result(
     path: str | Path,
     *,
@@ -970,6 +1516,7 @@ def write_result(
     config: dict[str, Any],
     run: RunMetadata | None = None,
     engine: dict[str, Any] | None = None,
+    manifest_class_counts: dict[str, int] | None = None,
 ) -> None:
     """Write one arm's result document.
 
@@ -978,6 +1525,11 @@ def write_result(
     key is always present — null when the arm was run without it — so a
     reader can tell "no engine config was recorded" from "these were the
     flags", rather than assuming.
+
+    ``manifest_class_counts`` is the workload's per-traffic-class item count.
+    Section 4's class-scoped denominators are counts of manifest items, and
+    only the runner ever sees the manifest, so the count travels with the
+    document; without it the metrics fall back to the rows present and say so.
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -992,8 +1544,10 @@ def write_result(
             "platform": platform.platform(),
             "host": platform.node(),
         },
-        "aggregate": aggregate_metrics(requests),
-        "paired": paired_summary(requests),
+        "aggregate": aggregate_metrics(requests, manifest_class_counts=manifest_class_counts),
+        "paired": paired_summary(
+            requests, manifest_class_counts=manifest_class_counts, engine=engine
+        ),
         "by_transform": aggregate_by_transform(requests),
         "requests": [r.to_dict() for r in requests],
     }

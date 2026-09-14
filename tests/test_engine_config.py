@@ -25,6 +25,7 @@ from sembench.engine_config import (
     snapshot_document,
     snapshots_from_document,
 )
+from sembench.gateway_live import GatewayRunResult
 from sembench.prometheus import (
     EXTERNAL_KV_TRANSFER_TOKENS_KEY,
     HITS_KEY,
@@ -260,12 +261,22 @@ def _fake_scrape(batches: list[list[MetricsSnapshot]]):
     return scrape
 
 
+def _no_traffic(config, *args, **kwargs):
+    """The runner seam, stubbed: no requests, and the manifest's class counts.
+
+    The CLI reads the counts off the run result (the runner is the only stage
+    that sees the manifest), so the stub has to return a run result rather
+    than a bare row list.
+    """
+    return GatewayRunResult(requests=(), throughput={}, manifest_class_counts={})
+
+
 def test_run_live_gateway_records_flags_and_counter_deltas(tmp_path: Path, monkeypatch):
     manifest = tmp_path / "fixture.jsonl"
     result = tmp_path / "gateway.json"
     main(["build", "--profile", "fixture", "--output", str(manifest)])
 
-    monkeypatch.setattr("sembench.cli.run_live_gateway", lambda *args, **kwargs: [])
+    monkeypatch.setattr("sembench.cli.run_live_gateway_measured", _no_traffic)
     monkeypatch.setattr(
         "sembench.cli.scrape_all",
         _fake_scrape(
@@ -311,7 +322,7 @@ def test_run_live_gateway_records_a_null_engine_block_when_no_serve_line_given(
     manifest = tmp_path / "fixture.jsonl"
     result = tmp_path / "gateway.json"
     main(["build", "--profile", "fixture", "--output", str(manifest)])
-    monkeypatch.setattr("sembench.cli.run_live_gateway", lambda *args, **kwargs: [])
+    monkeypatch.setattr("sembench.cli.run_live_gateway_measured", _no_traffic)
     monkeypatch.setattr("sembench.cli.scrape_all", _fake_scrape([[], []]))
 
     main(
@@ -339,7 +350,7 @@ def test_run_live_gateway_refuses_an_incomplete_serve_line_when_required(
 ):
     manifest = tmp_path / "fixture.jsonl"
     main(["build", "--profile", "fixture", "--output", str(manifest)])
-    monkeypatch.setattr("sembench.cli.run_live_gateway", lambda *args, **kwargs: [])
+    monkeypatch.setattr("sembench.cli.run_live_gateway_measured", _no_traffic)
     monkeypatch.setattr("sembench.cli.scrape_all", _fake_scrape([[], []]))
 
     with pytest.raises(SystemExit) as excinfo:

@@ -40,6 +40,27 @@ the four causes of a miss (:func:`boundary_miss_reason`); the
 quality claim; and, per request, the LAST of each, because
 ``get_num_new_matched_tokens`` is re-queried on every scheduling attempt and
 counting events would weight a contended request above an uncontended one.
+
+**Every field name below was read off the connector's own ``_audit_event``
+call, not inferred from the metric that consumes it.** The one that matters
+most is the boundary on a lookup hit: ``semantic_lookup_hit`` carries
+``already_computed_tokens`` (``connector.py``, the hit branch of
+``get_num_new_matched_tokens``) and carries no ``boundary`` key at all —
+``boundary`` is the name the *span* events use
+(``semantic_span_load_advertised``, ``semantic_span_boundary_missed``,
+``semantic_span_declined_unaligned_boundary``,
+``semantic_span_declined_below_min_after_clamp``,
+``semantic_span_supply_clamped``). Reading ``boundary`` off a hit silently
+produced ``None`` for every hit the connector ever wrote, which dropped the
+whole denominator of ``alignment_given_match``.
+
+The three span declines are folded for the same reason. A request whose
+lookup hit and whose span was then declined — off an unaligned boundary, or
+clamped below ``min_semantic_span``, or missed by the boundary entirely — is
+a *misalignment*, which is exactly what M1 exists to count. Without those
+branches such a request has no boundary anywhere on its row, drops out of
+``alignment_given_match``'s denominator, and the rate reports only the
+requests that went well.
 """
 
 from __future__ import annotations
@@ -59,11 +80,34 @@ EVENT_REQUEST_FIRST_SEEN = "request_first_seen"
 EVENT_LOOKUP_HIT = "semantic_lookup_hit"
 EVENT_LOAD_ADVERTISED = "semantic_span_load_advertised"
 EVENT_BOUNDARY_MISSED = "semantic_span_boundary_missed"
+EVENT_DECLINED_UNALIGNED_BOUNDARY = "semantic_span_declined_unaligned_boundary"
+EVENT_DECLINED_BELOW_MIN_AFTER_CLAMP = "semantic_span_declined_below_min_after_clamp"
+EVENT_SUPPLY_CLAMPED = "semantic_span_supply_clamped"
 EVENT_LOAD_ALLOCATED = "load_allocated"
 EVENT_MATERIALIZED = "runtime_materialized"
 EVENT_MATERIALIZATION_DECLINED = "runtime_materialization_declined"
 EVENT_PREFIX_BLOCKS_EVICTED = "prefix_cache_blocks_evicted"
 LOOKUP_SKIPPED_PREFIX = "lookup_skipped_"
+
+# The field a `semantic_lookup_hit` carries the engine's boundary in. It is
+# NOT called `boundary`: the hit event is written before any span arithmetic
+# runs, from the same `num_computed_tokens` the lookup request carried.
+LOOKUP_HIT_BOUNDARY_FIELD = "already_computed_tokens"
+# The field every span-scoped event carries the boundary in.
+SPAN_BOUNDARY_FIELD = "boundary"
+
+# Every way the connector can decline a span AFTER its lookup already hit.
+# Each one leaves the request with a donor and no served span, which is the
+# definition of a boundary misalignment, so each one has to keep the request
+# inside M1's match denominator.
+SPAN_DECLINE_EVENTS = (
+    EVENT_DECLINED_UNALIGNED_BOUNDARY,
+    EVENT_DECLINED_BELOW_MIN_AFTER_CLAMP,
+    EVENT_BOUNDARY_MISSED,
+)
+# Not a decline: the connector clamps the count and carries on, so the request
+# can still be advertised at this boundary. Folded only for the boundary.
+SPAN_BOUNDARY_EVENTS = (*SPAN_DECLINE_EVENTS, EVENT_SUPPLY_CLAMPED, EVENT_LOAD_ADVERTISED)
 
 # Section 4's boundary_miss_breakdown partition. Four causes land on the same
 # `return 0, False` inside the connector and only the miss event's payload can
@@ -110,6 +154,42 @@ class SpanRecord:
 
 
 @dataclass(frozen=True)
+class LookupHit:
+    """One ``semantic_lookup_hit``, folded field for field.
+
+    Every name here is the connector's own: ``already_computed_tokens`` (the
+    boundary the lookup ran at), ``reusable_tokens``, ``similarity``,
+    ``materialization_kind``, ``confidence_tier``, ``donor_id``, ``reason``.
+    """
+
+    boundary: int | None
+    donor_id: str | None
+    reusable_tokens: int | None
+    similarity: float | None
+    materialization_kind: str | None
+    confidence_tier: str | None
+    reason: str | None
+    attempt: int | None
+
+
+@dataclass(frozen=True)
+class SpanDecline:
+    """One span the connector declined after its lookup had already hit.
+
+    ``event`` is the connector's event name, so the three declines stay
+    distinguishable downstream; ``reason`` is the miss partition for a
+    ``semantic_span_boundary_missed`` and the event name for the other two,
+    which carry their cause in their name.
+    """
+
+    event: str
+    reason: str
+    boundary: int | None
+    donor_id: str | None
+    attempt: int | None
+
+
+@dataclass(frozen=True)
 class Advertisement:
     """The connector's load promise, as of the last advertise for a request."""
 
@@ -119,6 +199,11 @@ class Advertisement:
     donor_id: str | None
     attempt: int | None
     spans: tuple[SpanRecord, ...]
+    # Where the advertise sat in the audit file. Both connector roles append
+    # to one file, so line order is a real observation order across them, and
+    # M2 needs it to tell a materialization of THIS promise from one of the
+    # promise it superseded.
+    line_no: int = -1
 
     @property
     def boundary_at_span_start(self) -> bool | None:
@@ -141,15 +226,22 @@ class AuditRequest:
     prompt_tokens: int | None
     advertisement: Advertisement | None
     advertise_count: int
-    lookup_hit_count: int
-    # One entry per semantic_lookup_hit, holding the boundary the lookup ran
-    # at. None entries are hits whose payload carried no boundary.
-    lookup_hit_boundaries: tuple[int | None, ...]
+    # One entry per semantic_lookup_hit, in role-local order.
+    lookup_hits: tuple[LookupHit, ...]
+    # Every span the connector declined after a hit, in role-local order.
+    span_declines: tuple[SpanDecline, ...]
     boundary_missed_count: int
     last_missed_boundary: int | None
     boundary_miss_reasons: tuple[str, ...]
+    # The last boundary ANY span-scoped event was recorded at, whatever the
+    # outcome: advertise, clamp, decline or miss.
+    last_span_boundary: int | None
     allocated_tokens: int | None
     materialized_tokens: int | None
+    # Materialization mass written against a promise the connector has since
+    # superseded. Kept out of M2's numerator and published rather than dropped
+    # in silence -- see :func:`_fold`.
+    superseded_materialized_tokens: int
     declined_reasons: tuple[str, ...]
     lookup_skipped: tuple[str, ...]
     prefix_blocks_evicted: int
@@ -157,30 +249,36 @@ class AuditRequest:
     event_count: int
 
     @property
+    def lookup_hit_count(self) -> int:
+        return len(self.lookup_hits)
+
+    @property
     def observed_boundary(self) -> int | None:
         """The boundary the connector was last asked about.
 
-        The advertise wins when there is one; otherwise the last boundary a
-        miss was recorded at, so a request that never got a span still reports
-        where it stood instead of reporting nothing.
+        The advertise wins when there is one; otherwise the last boundary any
+        span event was recorded at — a miss, an unaligned-boundary decline, a
+        below-minimum decline or a clamp — so a request that never got a span
+        still reports where it stood instead of reporting nothing.
         """
         if self.advertisement is not None:
             return self.advertisement.boundary
-        return self.last_missed_boundary
+        return self.last_span_boundary
 
     @property
     def lookup_hit_boundary(self) -> int | None:
         """The boundary the LAST lookup hit ran at.
 
-        A hit whose payload carried no boundary falls back to
-        :attr:`observed_boundary` — the connector was asked about exactly one
-        boundary per attempt, so the advertise or miss recorded for the same
-        request is the same number — rather than dropping out of M1's
-        denominator, which would shrink it in silence.
+        Read from the hit's own ``already_computed_tokens``. A hit whose
+        payload carried neither that field nor a value falls back to
+        :attr:`observed_boundary` — the connector is asked about exactly one
+        boundary per attempt, so the span event recorded for the same request
+        is the same number — rather than dropping out of M1's denominator,
+        which would shrink it in silence.
         """
-        if not self.lookup_hit_boundaries:
+        if not self.lookup_hits:
             return None
-        last = self.lookup_hit_boundaries[-1]
+        last = self.lookup_hits[-1].boundary
         return self.observed_boundary if last is None else last
 
     @property
@@ -193,6 +291,11 @@ class AuditRequest:
         than an uncontended one.
         """
         return self.boundary_miss_reasons[-1] if self.boundary_miss_reasons else None
+
+    @property
+    def last_span_decline(self) -> SpanDecline | None:
+        """The LAST span decline, deduped per request for the same reason."""
+        return self.span_declines[-1] if self.span_declines else None
 
 
 @dataclass(frozen=True)
@@ -303,29 +406,6 @@ def _span_records(raw: Any) -> tuple[SpanRecord, ...]:
     )
 
 
-def _longest_raw_span(raw: Any) -> int | None:
-    """The longest pre-snap span the planner found, in tokens.
-
-    ``raw_spans`` entries carry ``length`` (B9's payload); an entry that
-    carries only ``target_start``/``target_end`` is measured from those. None
-    when the event listed no spans at all.
-    """
-    if not isinstance(raw, list):
-        return None
-    lengths: list[int] = []
-    for span in raw:
-        if not isinstance(span, dict):
-            continue
-        length = _as_int(span.get("length"))
-        if length is None:
-            start = _as_int(span.get("target_start"))
-            end = _as_int(span.get("target_end"))
-            length = None if start is None or end is None else end - start
-        if length is not None:
-            lengths.append(length)
-    return max(lengths) if lengths else None
-
-
 def boundary_miss_reason(payload: dict[str, Any]) -> str:
     """Partition one ``semantic_span_boundary_missed`` event by cause.
 
@@ -337,19 +417,44 @@ def boundary_miss_reason(payload: dict[str, Any]) -> str:
                                   n_raw_segments > 0, snapped=0 -> below_min_semantic_span
                                   otherwise                     -> true_misalignment
 
-    ``span`` is read as the longest pre-snap span the planner wanted, which is
-    the quantity the stored donor has to cover for the span to survive.
+    The second line is read off the payload the connector actually writes, not
+    off the arithmetic the plan describes. **A ``stored_donor_tokens < span``
+    test is unreachable.** The connector trims every segment to the captured
+    window before it builds ``raw_spans`` —
+    ``length = min(seg.token_count, stored_tokens - seg.donor_start)``, and a
+    segment whose ``length <= 0`` is dropped and counted in
+    ``segments_beyond_capture`` instead — so no entry in ``raw_spans`` can be
+    longer than ``stored_donor_tokens``, and the comparison never fires. What
+    a capture shortfall actually looks like in the payload is
+    ``segments_beyond_capture > 0``: the provider found spans in this donor and
+    the stored prefix did not reach them.
+
+    ``n_raw_segments == 0 and n_segments > 0`` is the same finding on a payload
+    that predates the per-cause counters: every segment was dropped before
+    snapping, and the drop is a capture shortfall unless
+    ``segments_wrong_donor`` accounts for it — in which case the planner
+    returned another donor's spans and the diagnosis is a misalignment, not a
+    short donor.
     """
     stored = _as_int(payload.get("stored_donor_tokens"))
+    segments = _as_int(payload.get("n_segments"))
     raw_segments = _as_int(payload.get("n_raw_segments"))
+    beyond_capture = _as_int(payload.get("segments_beyond_capture"))
+    wrong_donor = _as_int(payload.get("segments_wrong_donor"))
     snapped = payload.get("snapped_spans")
     snapped_count = len(snapped) if isinstance(snapped, list) else None
-    if stored is None and raw_segments is None and snapped_count is None:
+    if stored is None and raw_segments is None and snapped_count is None and beyond_capture is None:
         return MISS_UNCLASSIFIED
     if stored == 0:
         return MISS_DONOR_NOT_CAPTURED
-    span = _longest_raw_span(payload.get("raw_spans"))
-    if stored is not None and span is not None and stored < span:
+    if (beyond_capture or 0) > 0:
+        return MISS_DONOR_TOO_SHORT
+    if (
+        beyond_capture is None
+        and raw_segments == 0
+        and (segments or 0) > 0
+        and not (wrong_donor or 0)
+    ):
         return MISS_DONOR_TOO_SHORT
     if (raw_segments or 0) > 0 and not snapped_count:
         return MISS_BELOW_MIN_SEMANTIC_SPAN
@@ -417,6 +522,31 @@ def parse_events(lines: Iterable[str], *, path: str = "") -> tuple[list[_Event],
     return events, stats
 
 
+def _lookup_hit(payload: dict[str, Any]) -> LookupHit:
+    """One ``semantic_lookup_hit`` payload, field for field."""
+    similarity = payload.get("similarity")
+    return LookupHit(
+        boundary=_as_int(payload.get(LOOKUP_HIT_BOUNDARY_FIELD)),
+        donor_id=(None if payload.get("donor_id") is None else str(payload["donor_id"])),
+        reusable_tokens=_as_int(payload.get("reusable_tokens")),
+        similarity=(
+            float(similarity)
+            if isinstance(similarity, (int, float)) and not isinstance(similarity, bool)
+            else None
+        ),
+        materialization_kind=(
+            None
+            if payload.get("materialization_kind") is None
+            else str(payload["materialization_kind"])
+        ),
+        confidence_tier=(
+            None if payload.get("confidence_tier") is None else str(payload["confidence_tier"])
+        ),
+        reason=(None if payload.get("reason") is None else str(payload["reason"])),
+        attempt=_as_int(payload.get("attempt")),
+    )
+
+
 def _fold(request_id: str, events: Sequence[_Event]) -> AuditRequest:
     """Collapse one request's events into the facts the metrics need.
 
@@ -426,16 +556,31 @@ def _fold(request_id: str, events: Sequence[_Event]) -> AuditRequest:
     supersedes an earlier one — the connector only re-advertises when the plan
     changed at a new boundary — so the LAST advertise is the promise the
     engine acted on.
+
+    **M2's two sums obey one rule: the last advertise, and the materializations
+    that followed it.** The advertised side was already the last advertise;
+    the materialized side used to be every ``runtime_materialized`` event on
+    the request, which is a different rule on the other half of the same
+    ratio — a request re-advertised from 256 to 768 tokens and materialized
+    twice contributed 256+768 over 768 and read as 133% of its promise. "Came
+    after" is decided by position in the audit file, which is a real total
+    order across both roles because both append to one path (the scheduler
+    writes the advertise, the worker writes the materialization). Mass written
+    against a superseded promise is kept as ``superseded_materialized_tokens``
+    rather than dropped: it is evidence of KV that was written, just not of
+    this promise being kept.
     """
     ordered = sorted(events, key=lambda event: event.order)
     advertisement: Advertisement | None = None
     advertise_count = 0
-    lookup_hit_boundaries: list[int | None] = []
+    lookup_hits: list[LookupHit] = []
+    span_declines: list[SpanDecline] = []
     boundary_missed_count = 0
     last_missed_boundary: int | None = None
+    last_span_boundary: int | None = None
     miss_reasons: list[str] = []
     allocated: int | None = None
-    materialized: int | None = None
+    materializations: list[tuple[int, int]] = []
     declined: list[str] = []
     skipped: list[str] = []
     evicted = 0
@@ -447,35 +592,61 @@ def _fold(request_id: str, events: Sequence[_Event]) -> AuditRequest:
         if event.request_seq is not None:
             seqs_by_connector.setdefault(event.connector_id, set()).add(event.request_seq)
         payload = event.fields
+        if event.event in SPAN_BOUNDARY_EVENTS:
+            boundary = _as_int(payload.get(SPAN_BOUNDARY_FIELD))
+            if boundary is not None:
+                last_span_boundary = boundary
         if event.event == EVENT_REQUEST_FIRST_SEEN:
             first_seen = True
             prompt_tokens = _as_int(payload.get("prompt_tokens"))
         elif event.event == EVENT_LOOKUP_HIT:
-            lookup_hit_boundaries.append(_as_int(payload.get("boundary")))
+            lookup_hits.append(_lookup_hit(payload))
         elif event.event == EVENT_LOAD_ADVERTISED:
             advertise_count += 1
             advertisement = Advertisement(
-                boundary=_as_int(payload.get("boundary")),
+                boundary=_as_int(payload.get(SPAN_BOUNDARY_FIELD)),
                 target_start=_as_int(payload.get("target_start")),
                 tokens=_as_int(payload.get("token_count")) or 0,
                 donor_id=(None if payload.get("donor_id") is None else str(payload["donor_id"])),
                 attempt=_as_int(payload.get("attempt")),
                 spans=_span_records(payload.get("snapped_spans")),
+                line_no=event.line_no,
             )
-        elif event.event == EVENT_BOUNDARY_MISSED:
-            boundary_missed_count += 1
-            last_missed_boundary = _as_int(payload.get("boundary"))
-            miss_reasons.append(boundary_miss_reason(payload))
         elif event.event == EVENT_LOAD_ALLOCATED:
             allocated = (allocated or 0) + (_as_int(payload.get("tokens")) or 0)
         elif event.event == EVENT_MATERIALIZED:
-            materialized = (materialized or 0) + (_as_int(payload.get("tokens")) or 0)
+            materializations.append((event.line_no, _as_int(payload.get("tokens")) or 0))
         elif event.event == EVENT_MATERIALIZATION_DECLINED:
             declined.append(str(payload.get("declined_reason") or "unspecified"))
         elif event.event == EVENT_PREFIX_BLOCKS_EVICTED:
             evicted += _as_int(payload.get("blocks_evicted")) or 0
         elif event.event.startswith(LOOKUP_SKIPPED_PREFIX):
             skipped.append(event.event[len(LOOKUP_SKIPPED_PREFIX) :])
+        if event.event in SPAN_DECLINE_EVENTS:
+            reason = (
+                boundary_miss_reason(payload)
+                if event.event == EVENT_BOUNDARY_MISSED
+                else event.event
+            )
+            span_declines.append(
+                SpanDecline(
+                    event=event.event,
+                    reason=reason,
+                    boundary=_as_int(payload.get(SPAN_BOUNDARY_FIELD)),
+                    donor_id=(
+                        None if payload.get("donor_id") is None else str(payload["donor_id"])
+                    ),
+                    attempt=_as_int(payload.get("attempt")),
+                )
+            )
+            if event.event == EVENT_BOUNDARY_MISSED:
+                boundary_missed_count += 1
+                last_missed_boundary = _as_int(payload.get(SPAN_BOUNDARY_FIELD))
+                miss_reasons.append(reason)
+
+    advertise_line = -1 if advertisement is None else advertisement.line_no
+    kept = [tokens for line_no, tokens in materializations if line_no >= advertise_line]
+    superseded = sum(tokens for line_no, tokens in materializations if line_no < advertise_line)
 
     return AuditRequest(
         request_id=request_id,
@@ -484,13 +655,18 @@ def _fold(request_id: str, events: Sequence[_Event]) -> AuditRequest:
         prompt_tokens=prompt_tokens,
         advertisement=advertisement,
         advertise_count=advertise_count,
-        lookup_hit_count=len(lookup_hit_boundaries),
-        lookup_hit_boundaries=tuple(lookup_hit_boundaries),
+        lookup_hits=tuple(lookup_hits),
+        span_declines=tuple(span_declines),
         boundary_missed_count=boundary_missed_count,
         last_missed_boundary=last_missed_boundary,
         boundary_miss_reasons=tuple(miss_reasons),
+        last_span_boundary=last_span_boundary,
         allocated_tokens=allocated,
-        materialized_tokens=materialized,
+        # None, not 0, when the worker wrote no materialization event at all:
+        # "the audit looked and found none" is decided by `materializations`
+        # being empty, not by the mass summing to zero.
+        materialized_tokens=(sum(kept) if materializations else None),
+        superseded_materialized_tokens=superseded,
         declined_reasons=tuple(declined),
         lookup_skipped=tuple(skipped),
         prefix_blocks_evicted=evicted,
@@ -603,6 +779,8 @@ def stamp_row(row: RequestMetrics, record: AuditRequest | None) -> RequestMetric
         return replace(row, audit_joined=False)
     advertisement = record.advertisement
     materialized = record.materialized_tokens
+    last_hit = record.lookup_hits[-1] if record.lookup_hits else None
+    decline = record.last_span_decline
     return replace(
         row,
         external_confirmed_tokens=(
@@ -627,8 +805,13 @@ def stamp_row(row: RequestMetrics, record: AuditRequest | None) -> RequestMetric
         audit_declined_reasons=(list(record.declined_reasons) or None),
         audit_semantic_lookup_hit=record.lookup_hit_count > 0,
         audit_lookup_hit_boundary=record.lookup_hit_boundary,
+        audit_lookup_reusable_tokens=(None if last_hit is None else last_hit.reusable_tokens),
         audit_boundary_miss_reason=record.last_boundary_miss_reason,
         audit_boundary_missed_at=record.last_missed_boundary,
+        audit_span_decline_event=(None if decline is None else decline.event),
+        audit_span_decline_reason=(None if decline is None else decline.reason),
+        audit_span_declined_at=(None if decline is None else decline.boundary),
+        audit_superseded_materialized_tokens=record.superseded_materialized_tokens,
         audit_prefix_blocks_evicted=record.prefix_blocks_evicted,
     )
 

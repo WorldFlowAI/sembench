@@ -185,6 +185,10 @@ def test_manifest_expectations_reads_the_real_metadata_keys():
         "expected_span_target_start": 32,
         "traffic_class": "same_doc_new_instruction",
         "propagation_parent_item_id": "sd-086-seed",
+        # Round 5: M6's quality split and M3's same-position pairing are both
+        # manifest facts, so they are stamped by the same function.
+        "rope_delta_bucket": None,
+        "stream_position": None,
     }
 
 
@@ -383,10 +387,18 @@ def test_an_advertise_of_zero_tokens_is_not_an_alignment():
     [
         ({"stored_donor_tokens": 0, "n_raw_segments": 0}, MISS_DONOR_NOT_CAPTURED),
         (
+            # A captured donor the provider's spans reach past. The connector
+            # drops each such segment before it builds raw_spans and counts it
+            # in segments_beyond_capture -- which is why a
+            # `stored_donor_tokens < longest raw span` test never fires: every
+            # raw span was already trimmed to the captured window.
             {
                 "stored_donor_tokens": 512,
-                "n_raw_segments": 1,
-                "raw_spans": [{"target_start": 32, "length": 2048, "donor_start": 16}],
+                "n_segments": 2,
+                "n_raw_segments": 0,
+                "segments_wrong_donor": 0,
+                "segments_beyond_capture": 2,
+                "raw_spans": [],
                 "snapped_spans": [],
             },
             MISS_DONOR_TOO_SHORT,
@@ -633,8 +645,13 @@ def test_m7_reports_probes_it_could_not_score_instead_of_dropping_them():
     assert no_parent is not None and no_link is not None
     # The parent is not in this arm at all, so there is no served answer.
     assert no_parent["propagation_probes_without_served_answer"] == 1
-    assert no_parent["propagation_contamination_denominator"] == 0
-    assert no_parent["propagation_contamination_rate"] is None
+    # The probe stays in the denominator: a probe that could not be scored is
+    # not evidence of no contamination, so the headline rate divides by the
+    # probe SET and the scored-only rate keeps its own name.
+    assert no_parent["propagation_contamination_denominator"] == 1
+    assert no_parent["propagation_contamination_rate"] == 0.0
+    assert no_parent["propagation_contamination_scored_denominator"] == 0
+    assert no_parent["propagation_contamination_rate_scored_only"] is None
     assert no_link["propagation_probes_unlinked"] == 1
 
 

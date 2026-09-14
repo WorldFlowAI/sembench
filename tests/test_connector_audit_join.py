@@ -473,9 +473,17 @@ def test_alignment_given_opportunity_is_over_the_two_manifest_classes(audit_path
     # revised_doc (i3, i4). Of those, i1 and i3 advertised a non-zero span at
     # a non-zero boundary; i2 missed at 1008 and i4 was never advertised at
     # all. i5 (no_reuse) and the two probes are outside the denominator.
+    # No manifest counts reached this document, so the denominator is the
+    # opportunity rows present and says so.
     assert metrics["alignment_given_opportunity_denominator"] == 4
-    assert metrics["alignment_given_opportunity_numerator"] == 2
-    assert metrics["alignment_given_opportunity"] == 0.5
+    assert metrics["alignment_given_opportunity_denominator_source"] == "rows_present"
+    # Section 4's numerator is SHARED with alignment_given_match and is not
+    # restricted to the two classes: p2 (a propagation probe) advertised too.
+    # The excess is named rather than trimmed away in silence.
+    assert metrics["alignment_given_opportunity_numerator"] == 3
+    assert metrics["alignment_given_match_numerator"] == 3
+    assert metrics["alignment_given_opportunity_numerator_outside_classes"] == 1
+    assert metrics["alignment_given_opportunity"] == 0.75
     # The documented headline alias is the same number and nothing else.
     assert metrics["boundary_alignment_rate"] == metrics["alignment_given_opportunity"]
 
@@ -611,10 +619,10 @@ def test_the_aggregate_and_paired_summary_both_publish_the_three_rates(audit_pat
     aggregate = aggregate_metrics(warm)
     paired = paired_summary(cold + warm)
 
-    assert aggregate["boundary_alignment_rate"] == 0.5
+    assert aggregate["boundary_alignment_rate"] == 0.75
     assert aggregate["connector_audit_rows_joined"] == 5
     # The paired block reports the warm (connector) arm's audit metrics.
-    assert paired["boundary_alignment_rate"] == 0.5
+    assert paired["boundary_alignment_rate"] == 0.75
     assert paired["materialized_reuse_request_numerator"] == 2
     assert paired["propagation_cached_without_materialization_denominator"] == 2
     assert paired["connector_audit_present"] is True
@@ -635,7 +643,7 @@ def test_a_merged_documents_cold_arm_is_not_in_the_audit_denominators(audit_path
         == warm_only["alignment_given_opportunity_denominator"]
         == 4
     )
-    assert both_arms["boundary_alignment_rate"] == warm_only["boundary_alignment_rate"] == 0.5
+    assert both_arms["boundary_alignment_rate"] == warm_only["boundary_alignment_rate"] == 0.75
 
 
 def test_the_negative_control_gate_can_read_a_median(audit_path):

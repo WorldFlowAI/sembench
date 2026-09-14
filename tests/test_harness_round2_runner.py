@@ -19,6 +19,7 @@ import pytest
 from sembench import gateway_live
 from sembench.cli import _engine_metrics_urls, build_parser, main
 from sembench.gateway_live import (
+    GatewayRunResult,
     LiveGatewayConfig,
     engine_timing,
     run_live_gateway,
@@ -185,7 +186,11 @@ def test_cli_worker_url_defaults_to_an_empty_fleet():
 def test_cli_threads_the_worker_fleet_into_the_runner_config(tmp_path, monkeypatch):
     captured: list[LiveGatewayConfig] = []
     monkeypatch.setattr(
-        "sembench.cli.run_live_gateway", lambda config: captured.append(config) or []
+        "sembench.cli.run_live_gateway_measured",
+        lambda config: (
+            captured.append(config)
+            or GatewayRunResult(requests=(), throughput={}, manifest_class_counts={})
+        ),
     )
     monkeypatch.setattr("sembench.cli.scrape_all", lambda urls, **kw: [])
     manifest = _manifest(tmp_path, [_item("i0", donors=1)])

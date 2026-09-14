@@ -204,9 +204,10 @@ connector), run them separately and join afterwards:
 
 ```bash
 python -m sembench merge-results \
-  --cold results/cold.json \
-  --warm results/warm.json \
-  --output results/paired.json
+  --cold results/a1-stock-pc.json \
+  --warm results/a4-conn-span.json \
+  --output results/paired.json \
+  --pair m3_ttft
 ```
 
 The join is on `item_id` and the manifest SHA256, never a heuristic. It refuses
@@ -214,6 +215,24 @@ to merge when the arms do not join one-to-one, and when either result's own
 `run.arm` label contradicts the flag it was passed under — handing the warm run
 to `--cold` inverts every speedup downstream and nothing in the merged document
 would say so.
+
+`--pair` names which of the phase-0 plan's section-4 comparisons a merge is,
+because section 4 asks for five different cold/warm joins over the same eight
+arms and an unlabelled merged document cannot tell them apart:
+
+```text
+m3_ttft              A1 -> A4   M3 TTFT speedup and M6 answer quality: the headline
+m6_noise_floor       A1 -> A2   the cold-vs-cold floor M6's margin is set from
+m4_capture           A3 -> A4   M4's capture leg (miss_tax_ms on this document)
+m4_instrumentation   A5 -> A4   M4's instrumentation leg; subtract it from any
+                                published tax
+m7_propagation       A4 -> A6   M7 contamination
+```
+
+The pair is recorded on the merged document as `config.arm_pair` and checked
+against each arm's `--backend-id` / `--baseline-id`, so an A3-vs-A4 capture leg
+cannot be published as the M3 headline. Arms that did not label themselves are
+merged without complaint; a contradiction is refused.
 
 ## Engine Counters (the external-KV split)
 
@@ -288,9 +307,21 @@ which downstream is the same null as an arm that materialized nothing —
 `rows_id_mismatched` is what separates the two.
 
 The manifest supplies the other half of the join, stamped onto every row by
-the runner: `expected_supplied_tokens`, `expected_span_target_start`,
-`traffic_class` and (for a probe) `parent_item_id`. An absent key stamps
-`null`, never `0`.
+both live runners: `expected_supplied_tokens`, `expected_span_target_start`,
+`traffic_class`, `rope_delta_bucket` (M6's quality split), `stream_position`
+(M3 pairs twins at the same position) and, for a probe, `parent_item_id`. An
+absent key stamps `null`, never `0`.
+
+The manifest also supplies the *denominators*. Section 4's class-scoped rates
+count manifest items — 450 opportunity items, 50 propagation probes — not the
+rows a run happened to produce, so the runner writes the per-class item counts
+into `config.manifest_class_counts` and every such denominator is taken from
+them. `merge-results` carries them through. Without them the metrics fall back
+to the rows present and say so in
+`alignment_given_opportunity_denominator_source` /
+`propagation_probe_set_source`; a run that errored on half its opportunity
+items would otherwise divide by what survived and score itself better for
+having lost rows.
 
 What the join adds to the result — always beside its own numerator and
 denominator, so `0.0` over three requests is never read as `0.0` over three
@@ -299,29 +330,67 @@ hundred:
 - **M1, three numbers, all conditioned on `boundary > 0`.**
   `alignment_given_match` divides the advertises by the lookup hits (when the
   provider found a donor, did the boundary land on a span?);
-  `alignment_given_opportunity` divides them by the manifest's
-  `same_doc_new_instruction ∪ revised_doc` items (of the traffic that should
-  have been reusable, how much was served?) and is the headline —
-  `boundary_alignment_rate` is its alias and nothing else.
+  `alignment_given_opportunity` divides the **same numerator** by the
+  manifest's `same_doc_new_instruction ∪ revised_doc` item count (of the
+  traffic that should have been reusable, how much was served?) and is the
+  headline — `boundary_alignment_rate` is its alias and nothing else. The
+  numerator is shared exactly as section 4 writes it, so the opportunity rate
+  *can* exceed `1.0`: a `rope_delta_sweep` or `exact_repeat` item carries a
+  donor and advertises too.
+  `alignment_given_opportunity_numerator_outside_classes` says how many
+  advertises came from outside the denominator's population, so a rate above
+  one is readable instead of mysterious, and
+  `alignment_given_opportunity_rows_present` is the same numerator over the
+  opportunity rows this document actually holds.
   `boundary_miss_breakdown` partitions the misses into `donor_not_captured` /
-  `donor_too_short` / `below_min_semantic_span` / `true_misalignment`, so a
-  low alignment rate comes with its diagnosis. Beside them,
+  `donor_too_short` / `below_min_semantic_span` / `true_misalignment`, and
+  `span_decline_breakdown` counts the three ways a span is declined *after* a
+  lookup hit, so a low alignment rate comes with its diagnosis. Beside them,
   `expected_supplied_tokens_agreement_rate` checks the live planner against the
   offline model.
 - **M2, token-weighted.** `materialized_reuse_rate` is
   Σ `runtime_materialized` tokens / Σ advertised `token_count`
-  (`materialized_reuse_token_rate` is an alias of it). The request-count
-  question — how many advertising requests got any of their promise — is
-  `materialized_reuse_request_rate`, and neither substitutes for the other.
+  (`materialized_reuse_token_rate` is an alias of it). Both sums obey one
+  rule — the **last** advertise, and the materializations that followed it —
+  so a re-advertised request cannot report more mass than it was promised;
+  anything the worker wrote against a superseded promise is published as
+  `materialized_reuse_superseded_tokens` rather than dropped. The
+  request-count question — how many advertising requests got any of their
+  promise — is `materialized_reuse_request_rate`, and neither substitutes for
+  the other.
+- **M4, the miss tax, lives in the `paired` block.** `miss_tax_ms` is
+  median warm TTFT − median cold TTFT over the pairs whose warm row
+  **advertised nothing** (`audit_advertised_tokens` null or `0`), which is
+  section 4's `A4 | supplied == 0` population read off the audit rather than
+  off the outcome; positive is a tax. `miss_tax_pairs`,
+  `miss_tax_pairs_without_ttft`, `miss_tax_pairs_advertising_excluded` and
+  `miss_tax_pairs_negative_control_excluded` say who was in it,
+  `miss_tax_definition` states the population in the document itself, and
+  `miss_tax_ms_median_of_differences` (+ `_ci`) is the paired form of the same
+  question. `miss_tax_lookup_ms_per_lookup` is section 4's scheduler-thread
+  leg (`miss_tax_lookup_latency_ms_sum` / `miss_tax_lookups_total`) when the
+  arm's engine window carries those counters — `null`, never `0.0`, when it
+  does not (`miss_tax_lookup_cost_source` says which), because a zero would
+  subtract a cost nobody measured. The other two legs are
+  cross-arm: run `merge-results --pair m4_capture` (A3 vs A4) and
+  `--pair m4_instrumentation` (A5 vs A4) and read each document's
+  `miss_tax_ms`.
 - **M7 is cross-arm and lives in the `paired` block.**
-  `propagation_contamination_rate` is the share of `propagation_probe` items
-  whose treatment answer is closer to the *served* answer (their parent item's
-  answer in the same arm) than to the *cold* answer (their own answer in the
-  baseline arm). Probes it could not score are counted, never dropped:
+  `propagation_contamination_rate` is the share of the **`propagation_probe`
+  set** — the manifest's 50 items, not the probes that happened to be
+  scoreable — whose treatment answer is closer to the *served* answer (their
+  parent item's answer in the same arm) than to the *cold* answer (their own
+  answer in the baseline arm). A probe that could not be scored is not
+  evidence of no contamination, so it stays in the denominator and is named:
+  `propagation_probes_excluded_unclean_pair`,
   `propagation_probes_without_served_answer`, `propagation_probes_unlinked`,
-  `propagation_probes_without_answers`. Read it beside `prefix_blocks_evicted`
-  — until that counter reads non-zero on a contaminated workload, every
-  lane-2 quality number is unproven, including a favourable one. The per-row
+  `propagation_probes_without_answers`, `propagation_probes_absent_from_run`.
+  `propagation_contamination_rate_scored_only` (+
+  `propagation_contamination_scored_denominator`) is the scored subset under
+  its own name — read it to judge the headline, never in place of it. Read
+  both beside `prefix_blocks_evicted` — until that counter reads non-zero on a
+  contaminated workload, every lane-2 quality number is unproven, including a
+  favourable one. The per-row
   `propagation_cached_without_materialization_rate` is a supporting signal,
   not M7.
 - `connector_audit_present` / `connector_audit_rows_joined`, the two exclusion
@@ -421,16 +490,48 @@ See [docs/METRICS.md](docs/METRICS.md) for the exact metric contract.
   which are the harness's delay and not latency the engine produced. TTFT is
   unaffected; it is still measured at the streamed first token.
 - `alignment_given_match` / `alignment_given_opportunity` (alias:
-  `boundary_alignment_rate`) / `boundary_miss_breakdown`: M1. `null` until the
-  result is joined against a connector audit (`--connector-audit`).
+  `boundary_alignment_rate`) / `boundary_miss_breakdown` /
+  `span_decline_breakdown`: M1. `null` until the result is joined against a
+  connector audit (`--connector-audit`). The two rates share one numerator;
+  `alignment_given_opportunity_numerator_outside_classes` is why it can exceed
+  the two-class denominator, and
+  `alignment_given_opportunity_denominator_source` says whether the
+  denominator is the manifest's item count or the rows present.
 - `materialized_reuse_rate` (token-weighted; alias
-  `materialized_reuse_token_rate`) and `materialized_reuse_request_rate`: M2,
-  the mass that arrived and the requests that got any of it.
-- `propagation_contamination_rate` (+ `propagation_probes_without_served_answer`
-  and the other exclusion counts) in the `paired` block, and
-  `prefix_blocks_evicted` beside it: M7 and the counter that gates lane-2
-  quality. `propagation_cached_without_materialization_rate` is the
-  supporting per-row signal.
+  `materialized_reuse_token_rate`), `materialized_reuse_request_rate` and
+  `materialized_reuse_superseded_tokens`: M2 — the mass that arrived, the
+  requests that got any of it, and the mass written against a promise the
+  connector had already superseded.
+- `miss_tax_ms` (+ `miss_tax_pairs`, `miss_tax_warm_ttft_p50_ms` /
+  `miss_tax_cold_ttft_p50_ms`, `miss_tax_lookup_ms_per_lookup`) in the
+  `paired` block: M4, the tax the connector charges on requests it could not
+  serve.
+- `propagation_contamination_rate` (over the manifest's probe set, +
+  `propagation_probes_excluded_unclean_pair`,
+  `propagation_probes_without_served_answer` and the other exclusion counts,
+  with `propagation_contamination_rate_scored_only` beside it) in the `paired`
+  block, and `prefix_blocks_evicted` beside them: M7 and the counter that
+  gates lane-2 quality. `propagation_cached_without_materialization_rate` is
+  the supporting per-row signal.
+- Per-row audit fields: `audit_semantic_lookup_hit`,
+  `audit_lookup_hit_boundary` (the hit's own `already_computed_tokens` — that
+  event has no `boundary` key), `audit_lookup_reusable_tokens`,
+  `audit_advertised_tokens`, `audit_span_decline_event` /
+  `audit_span_decline_reason` / `audit_span_declined_at`,
+  `audit_superseded_materialized_tokens`, `audit_prefix_blocks_evicted`.
+- `alignment_given_opportunity_rows_present` (+
+  `alignment_given_opportunity_rows_present_denominator`): M1's shared
+  numerator over the opportunity rows this document holds, beside the
+  manifest-denominated headline.
+- `quality_by_rope_delta_bucket`: M6's quality split by the manifest's
+  `rope_delta_bucket` (0 / 128 / 512 / 2048). A quality result gathered only
+  at |delta| ~ 0 does not transfer, and a blended mean over a stream that is
+  93% |delta| ~ 0 cannot show damage that appears at 2048. `null` when no row
+  declares a bucket.
+- `pairs_stream_position_mismatched` / `pairs_unpaired` in the `paired` block:
+  twins the two arms replayed at different manifest stream positions (they did
+  not replay the same stream, so their ratio measures the reorder) and cold
+  rows with no warm twin. Both were previously dropped without a count.
 - `blended_ttft_speedup_median` (+ `_ci`): the headline paired speedup and the
   number `--min-blended-ttft-speedup` gates. Speedups are ratios and ratios are
   heavy-tailed, so one stalled cold arm can carry a mean over a bar the typical

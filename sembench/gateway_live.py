@@ -6,7 +6,7 @@ import hashlib
 import json
 import time
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -25,7 +25,13 @@ from sembench.request_ids import (
     sending_request_id,
     stamp_request_id,
 )
-from sembench.schema import RequestMetrics, WorkloadItem, manifest_expectations, read_jsonl
+from sembench.schema import (
+    RequestMetrics,
+    WorkloadItem,
+    manifest_class_counts,
+    manifest_expectations,
+    read_jsonl,
+)
 from sembench.throughput import request_record, summarize_throughput
 from sembench.tokenization import load_tokenizer
 
@@ -124,6 +130,12 @@ class GatewayRunResult:
     throughput: dict[str, Any]
     donor_records: tuple[dict[str, Any], ...] = ()
     recipient_records: tuple[dict[str, Any], ...] = ()
+    # How many items the replayed manifest holds per traffic class. Section
+    # 4's class-scoped denominators (M1's opportunity classes, M7's 50-item
+    # probe set) are counts of MANIFEST items, and this runner is the only
+    # stage that reads the manifest, so the counts have to leave here or every
+    # such denominator silently becomes "the rows that survived the run".
+    manifest_class_counts: dict[str, int] = field(default_factory=dict)
 
 
 def run_live_gateway(config: LiveGatewayConfig) -> list[RequestMetrics]:
@@ -163,7 +175,13 @@ def run_live_gateway_measured(config: LiveGatewayConfig) -> GatewayRunResult:
             "would fire while other requests are in flight and flush their KV mid-run. "
             "Run the paired/cold arms serially and the throughput arms without resets"
         )
-    return _replay_dispatched(config, plan, tokenizer, concurrency=concurrency)
+    return _replay_dispatched(
+        config,
+        plan,
+        tokenizer,
+        concurrency=concurrency,
+        class_counts=manifest_class_counts(items),
+    )
 
 
 def _replay_dispatched(
@@ -172,6 +190,7 @@ def _replay_dispatched(
     tokenizer,
     *,
     concurrency: int,
+    class_counts: dict[str, int] | None = None,
 ) -> GatewayRunResult:
     """Replay the plan through the dispatcher at `concurrency` requests in flight.
 
@@ -260,6 +279,7 @@ def _replay_dispatched(
         ),
         donor_records=tuple(donor_records),
         recipient_records=tuple(recipient_records),
+        manifest_class_counts=dict(class_counts or {}),
     )
 
 

@@ -8,6 +8,7 @@ import platform
 import subprocess
 import time
 import uuid
+from collections.abc import Sequence
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
@@ -163,6 +164,17 @@ class RequestMetrics:
     # reworded_doc). Falls back to `transform` when the manifest carries the
     # class there instead.
     traffic_class: str | None = None
+    # The RoPE delta bucket the manifest placed this item in (0 / 128 / 512 /
+    # 2048 on the `rope_delta_sweep` class, null everywhere else). Section 4
+    # (M6): "Report quality per RoPE-delta bucket. A quality result gathered
+    # only at |delta| <= 11 does not transfer." Null is "no bucket declared",
+    # which is not bucket 0.
+    rope_delta_bucket: int | None = None
+    # The item's position in the manifest's replay order. Section 4 (M3) pairs
+    # cold and warm "per item_id, at the same stream position": two arms whose
+    # twins sat at different positions replayed different streams, and their
+    # TTFT ratio is not a measurement of the cache.
+    stream_position: int | None = None
     # For a propagation_probe: the item whose request this one repeats
     # verbatim (manifest `parent_item_id`). M7 compares this row's answer
     # against that item's answer in the SAME arm -- the "served" output -- and
@@ -193,7 +205,13 @@ class RequestMetrics:
     # requests, so a request whose provider found nothing is not counted as a
     # misalignment.
     audit_semantic_lookup_hit: bool | None = None
+    # The boundary the LAST lookup hit ran at. The connector writes it as
+    # `already_computed_tokens` on `semantic_lookup_hit`; there is no
+    # `boundary` key on that event (see sembench.connector_audit).
     audit_lookup_hit_boundary: int | None = None
+    # `reusable_tokens` from that same hit: how much the provider said was
+    # reusable, before any block alignment or clamping. Not reuse.
+    audit_lookup_reusable_tokens: int | None = None
     # The last semantic_span_boundary_missed event for this request: why the
     # boundary landed outside every span, and where it landed. The reason
     # vocabulary is section 4's boundary_miss_breakdown partition
@@ -202,6 +220,20 @@ class RequestMetrics:
     # none of the fields the partition reads.
     audit_boundary_miss_reason: str | None = None
     audit_boundary_missed_at: int | None = None
+    # The LAST span the connector declined after its lookup had already hit:
+    # which event declined it (semantic_span_declined_unaligned_boundary,
+    # semantic_span_declined_below_min_after_clamp, or
+    # semantic_span_boundary_missed), the cause, and the boundary it happened
+    # at. A request that hit and was then declined is a misalignment and has
+    # to stay inside M1's match denominator, which needs a boundary on the row.
+    audit_span_decline_event: str | None = None
+    audit_span_decline_reason: str | None = None
+    audit_span_declined_at: int | None = None
+    # Materialized mass written against a promise the connector superseded
+    # before the worker got to it. Kept out of M2's numerator (whose rule is
+    # "the last advertise, and the materializations that followed it") and
+    # published so the mass is visible rather than silently dropped.
+    audit_superseded_materialized_tokens: int | None = None
     # Blocks the connector evicted from vLLM's exact prefix cache to stop a
     # semantically filled block being re-served through the local cache
     # without passing a gate. Section 4 (M7): until this counter exists and
@@ -274,12 +306,15 @@ def _metadata_str(metadata: dict[str, Any], key: str) -> str | None:
 def manifest_expectations(item: WorkloadItem) -> dict[str, Any]:
     """The manifest-side inputs to the connector-audit join, for one item.
 
-    Every live row constructor stamps these, because they are the half of the
-    join no engine can supply: what the offline model predicted the connector
-    would do (``expected_supplied_tokens`` / ``expected_span_target_start``),
-    which class of traffic the item is (``traffic_class`` -- M1's opportunity
-    denominator and M7's probe set), and which earlier item a propagation
-    probe repeats (``parent_item_id``).
+    Every live row constructor stamps these -- ``sembench.gateway_live`` and
+    ``sembench.sglang_live`` both -- because they are the half of the join no
+    engine can supply: what the offline model predicted the connector would do
+    (``expected_supplied_tokens`` / ``expected_span_target_start``), which
+    class of traffic the item is (``traffic_class`` -- M1's opportunity
+    denominator and M7's probe set), which earlier item a propagation probe
+    repeats (``parent_item_id``), which RoPE-delta bucket M6's quality split is
+    reported over (``rope_delta_bucket``), and where the item sat in the
+    replay order (``stream_position`` -- M3 pairs at the same position).
 
     Absent keys stay None rather than becoming zeros: "the manifest made no
     claim" and "the manifest predicted nothing" are different statements and
@@ -291,7 +326,42 @@ def manifest_expectations(item: WorkloadItem) -> dict[str, Any]:
         "expected_span_target_start": _metadata_int(metadata, "expected_span_target_start"),
         "traffic_class": _metadata_str(metadata, "traffic_class"),
         "propagation_parent_item_id": _metadata_str(metadata, "parent_item_id"),
+        "rope_delta_bucket": _metadata_int(metadata, "rope_delta_bucket"),
+        "stream_position": _metadata_int(metadata, "stream_position"),
     }
+
+
+def item_traffic_class(item: WorkloadItem) -> str:
+    """One manifest item's traffic class, falling back to ``transform``.
+
+    The same rule the results layer applies to a row
+    (``sembench.results.traffic_class_of``), so a manifest count and a row
+    count of the same class can be compared without one of them quietly
+    counting a different population.
+    """
+    return _metadata_str(item.metadata or {}, "traffic_class") or item.transform or ""
+
+
+def manifest_class_counts(items: Sequence[WorkloadItem]) -> dict[str, int]:
+    """How many items the manifest holds per traffic class.
+
+    Section 4 takes M1's ``alignment_given_opportunity`` over "manifest items
+    in same_doc_new_instruction u revised_doc" and M7 over "the 50
+    propagation_probe items" -- both are properties of the *workload*, not of
+    the rows a run happened to produce. A run that errored on half its
+    opportunity items, or was stopped early, must divide by what it was asked
+    to serve; dividing by the rows present would turn a truncated run into a
+    better-looking one.
+
+    The runner is the only place that reads the manifest, so it computes this
+    and the result document carries it forward.
+    """
+    counts: dict[str, int] = {}
+    for item in items:
+        name = item_traffic_class(item)
+        if name:
+            counts[name] = counts.get(name, 0) + 1
+    return dict(sorted(counts.items()))
 
 
 @dataclass(frozen=True)

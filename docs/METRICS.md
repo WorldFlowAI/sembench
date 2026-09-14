@@ -302,13 +302,84 @@ traffic_class                  no_reuse | same_doc_new_instruction | revised_doc
                                rope_delta_sweep | exact_repeat | propagation_probe |
                                reworded_doc
 propagation_parent_item_id     the item a propagation probe repeats verbatim
+rope_delta_bucket              0 | 128 | 512 | 2048 on the rope_delta_sweep class,
+                               null elsewhere -- M6's quality split
+stream_position                the item's place in the replay order -- M3 pairs
+                               twins at the same position
 ```
+
+Both live runners stamp them: `run-live-gateway` and `run-live-sglang`. A row
+that carries none of them is outside every class-scoped metric (M1's
+opportunity classes, M6's bucket split, M7's probe set) and outside the
+stream-position check the pairing does.
 
 An absent key stamps `null`, never `0`: "the manifest made no claim" and "the
 manifest predicted nothing would be supplied" are different statements about
 the same item. `expected_boundary_tokens` is deliberately **not** stamped — the
 plan calls it an upper bound whose divergence is routine and legitimate,
 because it depends on live GPU residency, eviction and preemption.
+
+### The manifest's denominators
+
+Section 4's class-scoped rates are taken over **manifest items**, not over the
+rows a run produced:
+
+```text
+alignment_given_opportunity   / |{manifest items in same_doc_new_instruction u revised_doc}|
+propagation_contamination     / |the 50 propagation_probe items|
+```
+
+The runner is the only stage that reads the manifest, so it writes the
+per-class item counts into `config.manifest_class_counts` and they travel with
+the result; `merge-results` carries them forward from the arms it joins. Every
+class-scoped denominator is taken from them, and
+`alignment_given_opportunity_denominator_source` /
+`propagation_probe_set_source` report `manifest` or `rows_present` so the
+substitution is never silent.
+
+This matters in exactly one direction. A run that errored on half its
+opportunity items, or was cut short by `--max-items`, divides by what survived
+if the counts are missing — and therefore scores itself **better** for having
+lost rows. `alignment_given_opportunity_rows_present` (+ its own denominator)
+is published beside the headline so the gap between the two is visible.
+
+### Payload fidelity: the field names are the connector's
+
+Every field the fold reads was taken from the connector's own `_audit_event`
+call. One of them is a trap worth naming, because getting it wrong produced a
+null rather than an error:
+
+```text
+semantic_lookup_hit                             already_computed_tokens   (the boundary)
+                                                reusable_tokens, similarity,
+                                                materialization_kind, confidence_tier
+semantic_span_load_advertised                   boundary, token_count, donor_start,
+                                                target_start, snapped_spans
+semantic_span_boundary_missed                   boundary, stored_donor_tokens,
+                                                n_segments, n_raw_segments,
+                                                segments_wrong_donor,
+                                                segments_beyond_capture, raw_spans,
+                                                snapped_spans
+semantic_span_declined_unaligned_boundary       boundary, block_size
+semantic_span_declined_below_min_after_clamp    boundary, token_count,
+                                                min_semantic_span
+semantic_span_supply_clamped                    boundary, requested_tokens,
+                                                clamped_tokens   (a clamp, not a decline)
+load_allocated / runtime_materialized           tokens
+prefix_cache_blocks_evicted                     blocks_evicted
+```
+
+**`semantic_lookup_hit` has no `boundary` key.** It is written before any span
+arithmetic runs and carries the boundary as `already_computed_tokens`; reading
+`boundary` there folded every hit to a null boundary, dropped every hit out of
+`alignment_given_match`'s denominator, and published the rate as null.
+
+The three span **declines** are folded too, and land on the row as
+`audit_span_decline_event` / `audit_span_decline_reason` /
+`audit_span_declined_at`. A request whose lookup hit and whose span was then
+declined — off an unaligned boundary, clamped below `min_semantic_span`, or
+missed by the boundary — is precisely the misalignment M1 counts, and without
+a boundary on its row it silently left the denominator.
 
 ### What the join produces
 
@@ -319,22 +390,53 @@ connector_audit_rows_considered           rows every rate below was computed ove
 connector_audit_rows_excluded_cold_arm    cold rows: no connector ran in that arm
 connector_audit_rows_excluded_not_joined  rows no audit was joined to at all
 
+manifest_class_counts                     the workload the denominators below count
+
 alignment_given_match                     M1  + _numerator / _denominator
 alignment_given_opportunity               M1  + _numerator / _denominator
+alignment_given_opportunity_numerator_outside_classes
+                                          advertises won outside the two classes
+alignment_given_opportunity_denominator_source
+                                          "manifest" or "rows_present"
+alignment_given_opportunity_rows_present  same numerator over the rows held
+alignment_given_opportunity_rows_present_denominator
 boundary_alignment_rate                   alias of alignment_given_opportunity
 boundary_miss_breakdown                   M1, {reason: count}
+span_decline_breakdown                    M1, {decline event: count}
 expected_supplied_tokens_agreement_rate   M1 integrity check + _numerator / _denominator
 expected_span_target_start_agreement_rate M1 integrity check + _numerator / _denominator
 
 materialized_reuse_rate                   M2, token-weighted (the headline)
 materialized_reuse_tokens                 its numerator
 materialized_reuse_advertised_tokens      its denominator
+materialized_reuse_superseded_tokens      mass written against a superseded promise
 materialized_reuse_token_rate             alias of materialized_reuse_rate
 materialized_reuse_request_rate           M2 by request + _numerator / _denominator
 
 prefix_blocks_evicted                     M7's gating counter, + rows_with_prefix_blocks_evicted
 propagation_cached_without_materialization_rate
                                           M7 supporting signal + _numerator / _denominator
+```
+
+And per row, from the audit fold:
+
+```text
+audit_semantic_lookup_hit                 did the provider find a donor at all
+audit_lookup_hit_boundary                 the hit's own already_computed_tokens
+audit_lookup_reusable_tokens              the hit's reusable_tokens (a claim, not reuse)
+audit_observed_boundary                   last advertise, else last span event
+audit_advertised_tokens                   the LAST advertise's token_count
+audit_advertised_target_start
+audit_boundary_at_span_start
+audit_boundary_miss_reason                the partition above
+audit_boundary_missed_at
+audit_span_decline_event                  which of the three declines, and
+audit_span_decline_reason                 why, and
+audit_span_declined_at                    at which boundary
+audit_load_allocated / audit_materialized
+audit_superseded_materialized_tokens      mass written against a superseded promise
+audit_declined_reasons
+audit_prefix_blocks_evicted
 ```
 
 **Which rows count.** Every rate above is computed over the *auditable* rows
@@ -363,24 +465,47 @@ boundary_miss_breakdown      = boundary_missed events partitioned by reason:
                                otherwise                     -> true_misalignment
 ```
 
-The two rates differ only in what they condition on. `alignment_given_match`
-asks *when the provider found a donor, did the engine's boundary land on a
-span?* — a property of the tokenizer and the template, and null (never `1.0`)
-when the connector emits no `semantic_lookup_hit` events to divide by.
-`alignment_given_opportunity` asks *of the traffic that should have been
-reusable, how much was served?* — the product number, and therefore the
+The two rates share one numerator and differ only in what they condition on.
+`alignment_given_match` asks *when the provider found a donor, did the engine's
+boundary land on a span?* — a property of the tokenizer and the template, and
+null (never `1.0`) when the connector emits no `semantic_lookup_hit` events to
+divide by. `alignment_given_opportunity` asks *of the traffic that should have
+been reusable, how much was served?* — the product number, and therefore the
 headline; `boundary_alignment_rate` is its alias and nothing else.
 
-Two deliberate deviations, both to keep the numbers honest:
+**The numerator is shared, exactly as section 4 writes it, so the opportunity
+rate can exceed `1.0`.** Not every advertise comes from one of the two
+classes: a `rope_delta_sweep` or `exact_repeat` item carries a donor and
+advertises too. Restricting the numerator to the two classes would make the
+number look like a fraction while answering a question section 4 did not ask,
+so the excess is named instead —
+`alignment_given_opportunity_numerator_outside_classes` is exactly how many of
+the advertises came from outside the denominator's population, and a rate above
+one is read against it.
 
-- the opportunity rate counts its numerator over its own denominator's
-  population. Section 4 shares one numerator between the two rates, which
-  works only if every advertise comes from one of the two classes; it does not
-  (`rope_delta_sweep` items carry donors too), and a shared numerator over a
-  two-class denominator can exceed `1.0` and stop being a fraction.
-- a miss event carrying none of the partition's fields is `unclassified`
-  rather than `true_misalignment`. A pre-B9 connector's payload contains no
-  diagnosis, and publishing one from it would invent the finding.
+`boundary_miss_breakdown`'s second line is read off the payload the connector
+writes, not off the arithmetic above it. **A `stored_donor_tokens < span` test
+is unreachable**: the connector trims every segment to the captured window
+before it builds `raw_spans` —
+`length = min(seg.token_count, stored_tokens - seg.donor_start)`, and a segment
+whose length is `<= 0` is dropped and counted in `segments_beyond_capture` —
+so no raw span can be longer than the stored donor and the comparison never
+fires. A capture shortfall is `segments_beyond_capture > 0`, or, on a payload
+predating those counters, `n_raw_segments == 0 and n_segments > 0` with no
+`segments_wrong_donor` to account for it. Classifying on the unreachable rule
+meant the bucket never fired and every short-donor miss was published as a
+misalignment.
+
+Beside it, `span_decline_breakdown` counts the three declines that follow a
+lookup hit (`semantic_span_declined_unaligned_boundary`,
+`semantic_span_declined_below_min_after_clamp`,
+`semantic_span_boundary_missed`). Together the two breakdowns account for
+every hit that was not served.
+
+One deliberate deviation remains: a miss event carrying none of the
+partition's fields is `unclassified` rather than `true_misalignment`. A pre-B9
+connector's payload contains no diagnosis, and publishing one from it would
+invent the finding.
 
 The integrity check beside them compares the live planner with the offline
 model: `expected_supplied_tokens_agreement_rate` over the rows that carried
@@ -402,8 +527,61 @@ for continuity). The request-count form — how many advertising requests got
 `materialized_reuse_request_rate`. The two disagree whenever the served
 requests are not the large ones, which is exactly when the difference matters.
 
+**Both sums obey one rule: the last advertise, and the materializations that
+followed it.** The denominator was already the last advertise — the connector
+re-advertises only when the plan changed — while the numerator summed every
+`runtime_materialized` event on the request. That is a different rule on each
+half of one ratio: a request advertised at 256 tokens, materialized, then
+re-advertised at 768 and materialized again reported `(256 + 768) / 768` —
+133% of its promise, with no extra KV reused. "Followed" is decided by position
+in the audit file, which is a real total order across both roles because both
+append to one path. Mass written against a superseded promise is published as
+`materialized_reuse_superseded_tokens` rather than dropped: KV was written,
+just not against the promise the denominator holds.
+
 An advertise is a promise and an allocation is a destination; only
 `runtime_materialized` is evidence that KV was written.
+
+#### M4 — miss tax (paired documents only)
+
+```text
+median ttft_ms(A4 | supplied == 0) - median ttft_ms(A1), over the same item_ids
+```
+
+"Supplied == 0" is read off the audit, not off the outcome: a pair is in the
+population when its warm row **advertised nothing** —
+`audit_advertised_tokens` is null (the connector said nothing about it) or `0`
+(it looked and supplied nothing). A row that advertised and then failed to
+materialize is *not* in it: it was served a promise, and its latency prices
+keeping or breaking that promise rather than the cost of a miss. Negative
+controls are excluded for the same reason the blended speedup excludes them,
+and the count says so.
+
+```text
+miss_tax_ms                              median warm TTFT - median cold TTFT; positive is a tax
+miss_tax_ms_median_of_differences        the paired form, + _ci
+miss_tax_warm_ttft_p50_ms                its two terms
+miss_tax_cold_ttft_p50_ms
+miss_tax_pairs                           pairs in the population
+miss_tax_pairs_without_ttft              in the population, but one arm never answered
+miss_tax_pairs_advertising_excluded      pairs whose warm row advertised
+miss_tax_pairs_negative_control_excluded
+miss_tax_definition                      the population, stated in the document
+miss_tax_lookup_latency_ms_sum           section 4's scheduler-thread leg, from the
+miss_tax_lookups_total                   arm's engine counter window
+miss_tax_lookup_ms_per_lookup
+miss_tax_lookup_cost_source              "engine_window", or null when unmeasured
+```
+
+Section 4 decomposes the tax into three legs. Only the first is a per-arm
+counter ratio (`lookup_latency_ms_sum / lookups_total`), and it is available
+only when the connector exports those counters onto the endpoint the run
+scraped; stock vLLM exposes neither, so on a stock arm the leg is **null, not
+zero** — a zero would subtract a cost nobody measured from a published tax.
+The other two legs are cross-arm and each is a `merge-results --pair` away:
+`m4_capture` (A3 → A4) and `m4_instrumentation` (A5 → A4). Each of those
+documents' own `miss_tax_ms` is the leg it measured, and
+`config.arm_pair` says which leg that is.
 
 #### M7 — contamination / propagation (paired documents only)
 
@@ -412,12 +590,29 @@ needs both arms:
 
 ```text
 propagation_contamination_rate            + _numerator / _denominator
+propagation_contamination_denominator     the PROBE SET, not the scored probes
+propagation_probe_set_source              "manifest" or "rows_present"
+propagation_contamination_rate_scored_only
+                                          + propagation_contamination_scored_denominator
 propagation_definition                    what the comparison actually did
 propagation_probe_pairs                   probe items present in both arms
+propagation_probes_excluded_unclean_pair  no twin, contaminated cold arm, an error,
+                                          or a stream-position mismatch
 propagation_probes_unlinked               no parent_item_id on the row
 propagation_probes_without_served_answer  parent absent, or answered nothing
 propagation_probes_without_answers        probe missing an answer in an arm
+propagation_probes_absent_from_run        declared by the manifest, no row here
 ```
+
+**The denominator is the probe set.** Section 4 says "A4 vs A6 on the 50
+`propagation_probe` items", and a probe that could not be scored is not
+evidence of no contamination — it is a probe that was not read. Dividing by
+the scored subset turns every failure to score into a better contamination
+number, which is the one direction a contamination metric must never drift.
+So the headline rate divides by the manifest's probe count and every exclusion
+is published beside it; `propagation_contamination_rate_scored_only` keeps the
+scored subset under its own name, to judge the headline by and never to
+replace it.
 
 A propagation probe is a verbatim repeat of an earlier request that was served
 approximate KV, so three answers exist for one prompt: the **served** answer
@@ -442,6 +637,44 @@ key is `null` when no audit was joined — not `0.0`. A run that never looked
 must not publish a clean score, and `config.connector_audit_join` records rows
 matched exactly, matched after normalization, unmatched, ambiguous, and without
 an id at all, so a shrunken denominator is never silent.
+
+## Pairing (which twins are comparable)
+
+Section 4 states M3 as "per `item_id`, at the same stream position". Both
+twins carry the manifest's `stream_position`, so the pairing checks it: twins
+at different positions did not replay the same stream — a re-ordered or edited
+manifest between the arms — and their TTFT ratio measures the reorder, not the
+cache. A row that declares no position makes no claim and is not excluded by
+it.
+
+```text
+pairs_total                        items in the cold arm
+pairs_used                         clean pairs with a TTFT on both sides
+pairs_contaminated                 cold twin whose cache reset did not take
+pairs_errored                      either arm returned an error
+pairs_unpaired                     cold row with no warm twin
+pairs_stream_position_mismatched   twins at different manifest positions
+```
+
+`pairs_unpaired` and `pairs_stream_position_mismatched` were previously
+dropped without a count.
+
+## Answer Quality By RoPE Delta (M6)
+
+```text
+quality_by_rope_delta_bucket   {"0": {...}, "128": {...}, "512": {...}, "2048": {...}}
+                               per bucket: requests, mean_quality_f1,
+                               mean_quality_rouge_l, quality_pass_rate, mean_ttft_ms
+```
+
+Section 4: "Report quality per RoPE-delta bucket from the `rope_delta_sweep`
+class. A quality result gathered only at |delta| <= 11 does not transfer."
+Re-rotating donor KV across a large positional delta is the specific quality
+risk lane 2 carries, and a blended mean over a stream that is 93% |delta| ~ 0
+cannot show it. The bucket comes from the manifest (`rope_delta_bucket`), keys
+are strings because the result is JSON, and the whole block is `null` when no
+row declares a bucket — the split was not measured, which is not the same as a
+workload with no positional deltas.
 
 ## Latency
 

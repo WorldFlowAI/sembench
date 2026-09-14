@@ -10,7 +10,13 @@ from typing import Any
 
 from sembench.exact_cache import ExactBlockIndex, full_block_tokens
 from sembench.quality import quality_score, rouge_l_best, token_f1
-from sembench.schema import RequestMetrics, WorkloadItem, read_jsonl
+from sembench.schema import (
+    RequestMetrics,
+    WorkloadItem,
+    manifest_class_counts,
+    manifest_expectations,
+    read_jsonl,
+)
 from sembench.tokenization import load_tokenizer
 
 
@@ -214,6 +220,14 @@ def _metrics_from_live_item(
     response: dict[str, Any],
     arm: str = "single",
 ) -> RequestMetrics:
+    """One row for one replayed item, including the manifest's half of it.
+
+    ``manifest_expectations`` is stamped here as well as in the gateway
+    runner: traffic class, RoPE-delta bucket and stream position are manifest
+    facts no engine reports, and a row without them drops out of every
+    class-scoped metric (M1's opportunity classes, M6's bucket split, M7's
+    probe set) and out of the stream-position check the pairing does.
+    """
     donor_tokens = {donor.donor_id: tokenizer.encode(donor.text) for donor in item.donor_prompts}
     recipient_tokens = tokenizer.encode(item.recipient_prompt)
     exact = ExactBlockIndex(config.block_size)
@@ -234,6 +248,7 @@ def _metrics_from_live_item(
     answer_rouge = rouge_l_best(output_text, item.answers)
 
     return RequestMetrics(
+        **manifest_expectations(item),
         item_id=item.item_id,
         dataset=item.dataset,
         transform=item.transform,
@@ -367,3 +382,15 @@ async def _send_generate(
 
 def run_live_sglang_sync(config: LiveSglangConfig) -> list[RequestMetrics]:
     return asyncio.run(run_live_sglang(config))
+
+
+def manifest_class_counts_for(config: LiveSglangConfig) -> dict[str, int]:
+    """The replayed manifest's per-traffic-class item counts.
+
+    Section 4's class-scoped denominators count manifest items, not rows, so
+    the count has to reach the result document from the only stage that reads
+    the manifest. The file is read a second time rather than threaded through
+    the async replay: this runner is the optional path and the read is cheap
+    next to a GPU arm.
+    """
+    return manifest_class_counts(read_jsonl(config.manifest, max_items=config.max_items))

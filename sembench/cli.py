@@ -19,15 +19,18 @@ from sembench.engine_events import parse_engine_events
 from sembench.gateway_live import (
     LiveGatewayConfig,
     parse_worker_urls,
-    run_live_gateway,
     run_live_gateway_measured,
 )
 from sembench.longbench import DEFAULT_LONGBENCH_V1_DATASETS, load_source_records
 from sembench.offline import OfflineConfig, run_offline
 from sembench.prometheus import MetricsWindow, scrape_all
-from sembench.results import write_result
+from sembench.results import PHASE0_ARM_PAIRS, write_result
 from sembench.schema import write_jsonl
-from sembench.sglang_live import LiveSglangConfig, run_live_sglang_sync
+from sembench.sglang_live import (
+    LiveSglangConfig,
+    manifest_class_counts_for,
+    run_live_sglang_sync,
+)
 from sembench.transforms import DEFAULT_TRANSFORMS, TransformConfig, build_workload
 
 
@@ -449,6 +452,16 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Merge anyway when the arms do not join one-to-one (the pairing report still "
         "records every unpaired row; the paired summary is then a subset, not the run)",
+    )
+    merge.add_argument(
+        "--pair",
+        default=None,
+        choices=sorted(PHASE0_ARM_PAIRS),
+        help="Which of the phase-0 plan's section-4 comparisons this merge is "
+        "(m3_ttft = A1 vs A4, m6_noise_floor = A1 vs A2, m4_capture = A3 vs A4, "
+        "m4_instrumentation = A5 vs A4, m7_propagation = A4 vs A6). Recorded on the "
+        "merged document and checked against each arm's --backend-id/--baseline-id, so "
+        "an A3-vs-A5 merge cannot be published as the M3 headline",
     )
     _add_connector_audit_arg(merge)
 
@@ -882,14 +895,19 @@ def cmd_run_live_sglang(args) -> None:
         resume=args.resume,
     )
     requests = run_live_sglang_sync(config)
+    # The manifest's per-class item counts: section 4's class-scoped
+    # denominators count manifest items, not the rows a run produced.
+    class_counts = manifest_class_counts_for(config)
     write_result(
         args.output,
         requests=requests,
         config={
             "mode": "live-sglang",
             **config.__dict__,
+            "manifest_class_counts": class_counts,
         },
         run=_run_metadata(args, engine="sglang", engine_version=detected_version),
+        manifest_class_counts=class_counts,
     )
     print(json.dumps({"output": args.output, "requests": len(requests)}, indent=2))
 
@@ -953,13 +971,18 @@ def cmd_run_live_gateway(args) -> None:
     # process-lifetime total inherited from whatever ran before it.
     metrics_urls = _engine_metrics_urls(args)
     before = tuple(scrape_all(metrics_urls))
-    # A run that was asked for a throughput document needs the measured
-    # variant; a plain serial arm is the same replay either way.
-    wants_throughput = args.concurrency > 1 or bool(args.throughput_output)
-    run = run_live_gateway_measured(config) if wants_throughput else None
-    replayed = list(run.requests) if run is not None else run_live_gateway(config)
+    run = run_live_gateway_measured(config)
     after = tuple(scrape_all(metrics_urls))
-    requests, audit_join = _join_connector_audit(replayed, connector_audit)
+    requests, audit_join = _join_connector_audit(list(run.requests), connector_audit)
+    engine = engine_document(
+        arm=args.arm,
+        flags=engine_flags,
+        window=MetricsWindow(before=before, after=after),
+    )
+    # The runner is the only stage that reads the manifest, so the per-class
+    # item counts section 4's denominators are taken over travel with the
+    # result rather than being re-derived from the rows that survived.
+    class_counts = dict(run.manifest_class_counts)
     write_result(
         args.output,
         requests=requests,
@@ -969,16 +992,16 @@ def cmd_run_live_gateway(args) -> None:
             "connector_audit": connector_audit,
             "connector_audit_join": audit_join,
             "request_id_echo": _request_id_echo(requests),
+            "manifest_class_counts": class_counts,
         },
         run=run_metadata,
-        engine=engine_document(
-            arm=args.arm,
-            flags=engine_flags,
-            window=MetricsWindow(before=before, after=after),
-        ),
+        engine=engine,
+        manifest_class_counts=class_counts,
     )
     summary = {"output": args.output, "requests": len(requests)}
-    if run is not None:
+    # A throughput document is what the concurrency arms are for; a serial arm
+    # writes one only when asked.
+    if args.concurrency > 1 or args.throughput_output:
         throughput_path = write_throughput_document(
             output=args.output,
             explicit_path=args.throughput_output,
@@ -1041,9 +1064,18 @@ def cmd_merge_results(args) -> None:
         requests_from_result,
         result_manifest_sha256,
     )
-    from sembench.results import arm_label_conflicts
+    from sembench.results import (
+        arm_label_conflicts,
+        arm_pair,
+        arm_pair_conflicts,
+        result_manifest_class_counts,
+    )
 
     connector_audit = _connector_audit_or_exit(args)
+    try:
+        pair = arm_pair(args.pair) if args.pair else None
+    except ValueError as exc:
+        raise SystemExit(f"merge-results: {exc}") from exc
     try:
         cold_payload = json.loads(Path(args.cold).read_text(encoding="utf-8"))
         warm_payload = json.loads(Path(args.warm).read_text(encoding="utf-8"))
@@ -1051,6 +1083,8 @@ def cmd_merge_results(args) -> None:
         raise SystemExit(f"merge-results: {exc}") from exc
 
     conflicts = arm_label_conflicts(cold_payload, warm_payload)
+    if pair is not None:
+        conflicts.extend(arm_pair_conflicts(pair, cold_payload, warm_payload))
     if conflicts:
         print(
             json.dumps(
@@ -1078,6 +1112,14 @@ def cmd_merge_results(args) -> None:
         raise SystemExit(1)
 
     joined_rows, audit_join = _join_connector_audit(rows, connector_audit)
+    # Both arms replayed the same manifest (the pairing check above refuses
+    # anything else), so either arm's counts are the workload's. The warm arm
+    # is preferred only because it is the one whose metrics they scope.
+    class_counts = result_manifest_class_counts(warm_payload) or result_manifest_class_counts(
+        cold_payload
+    )
+    # M4's per-lookup cost is read off the treatment arm's engine window.
+    warm_engine = warm_payload.get("engine")
     write_result(
         args.output,
         requests=joined_rows,
@@ -1090,12 +1132,18 @@ def cmd_merge_results(args) -> None:
             "connector_audit": connector_audit,
             "connector_audit_join": audit_join,
             "request_id_echo": _request_id_echo(joined_rows),
+            "manifest_class_counts": class_counts,
+            # Which of section 4's comparisons this document is, when the
+            # operator named one. Null means "an unlabelled cold/warm join".
+            "arm_pair": pair.to_dict() if pair is not None else None,
             "arms": {
                 "cold": _arm_provenance(cold_payload),
                 "warm": _arm_provenance(warm_payload),
             },
         },
         run=merged_run_metadata(cold_payload, warm_payload, run_id=args.run_id),
+        engine=warm_engine,
+        manifest_class_counts=class_counts,
     )
     print(
         json.dumps(
