@@ -27,7 +27,9 @@ def test_summarize_load_counts_every_request_and_only_output_tokens():
         {"ttft_ms": 600.0, "latency_ms": 1300.0, "output_tokens": 32},
         {"ttft_ms": 400.0, "latency_ms": 1100.0, "output_tokens": 32},
     ]
-    doc = summarize_load(donors=donors, recipients=recipients, wall_seconds=10.0, items=4, concurrency=2)
+    doc = summarize_load(
+        donors=donors, recipients=recipients, wall_seconds=10.0, items=4, concurrency=2
+    )
     assert doc["requests"] == 7
     assert doc["errors"] == 1
     assert doc["requests_per_second"] == 0.7
@@ -67,9 +69,18 @@ def test_run_load_cli_parses_concurrency_and_delay():
     args = build_parser().parse_args(
         [
             "run-load",
-            "--manifest", "m.jsonl", "--output", "o.json",
-            "--gateway-url", "http://127.0.0.1:1", "--model", "m",
-            "--concurrency", "8", "--post-donor-delay-ms", "500",
+            "--manifest",
+            "m.jsonl",
+            "--output",
+            "o.json",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--model",
+            "m",
+            "--concurrency",
+            "8",
+            "--post-donor-delay-ms",
+            "500",
         ]
     )
     assert args.command == "run-load"
@@ -96,6 +107,7 @@ def test_run_load_delegates_to_the_gateway_runner():
 def test_run_load_document_keeps_its_shape(tmp_path: Path, monkeypatch):
     """`run-load` is now a wrapper, and every key its consumers read has to
     survive that."""
+
     def fake_chat_completion(*, prompt, **_kwargs):
         return {
             "output_text": "42",
@@ -176,8 +188,7 @@ def test_every_cli_command_is_defined_before_the_main_guard():
     guard_lines = [
         node.lineno
         for node in tree.body
-        if isinstance(node, ast.If)
-        and ast.dump(node.test).find("__main__") != -1
+        if isinstance(node, ast.If) and ast.dump(node.test).find("__main__") != -1
     ]
     assert guard_lines, "the __main__ guard moved or vanished"
     defined_late = [

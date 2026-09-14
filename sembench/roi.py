@@ -213,11 +213,15 @@ def parse_rates(spec: str | None, default: float, tokens: list[int]) -> dict[int
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
     ap.add_argument("--histogram", required=True, help="tokens:share,... or a CSV of tokens,share")
     ap.add_argument("--hit-rate", type=float, default=0.0, help="uniform semantic hit rate")
     ap.add_argument("--hit-rate-by-bucket", default=None, help="tokens:rate,... overrides")
-    ap.add_argument("--qps", type=float, default=0.0, help="fleet requests/s for GPU-second savings")
+    ap.add_argument(
+        "--qps", type=float, default=0.0, help="fleet requests/s for GPU-second savings"
+    )
     ap.add_argument("--json", action="store_true", help="emit the full report as JSON")
     for f in CostModel.__dataclass_fields__:
         ap.add_argument(f"--{f.replace('_', '-')}", type=float, default=None)
@@ -237,7 +241,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.json:
         print(json.dumps({"cost_model": asdict(cost), "report": asdict(report)}, indent=2))
         return 0
-    print(f"{'tokens':>8} {'share':>6} {'hit%':>5} {'cold':>8} {'miss':>8} {'hit':>8} {'expect':>8} {'delta':>8} {'breakeven':>9}")
+    print(
+        f"{'tokens':>8} {'share':>6} {'hit%':>5} {'cold':>8} {'miss':>8} {'hit':>8} {'expect':>8} {'delta':>8} {'breakeven':>9}"
+    )
     for b in report.buckets:
         print(
             f"{b.prompt_tokens:>8} {b.traffic_share:>6.2f} {100 * b.hit_rate:>5.0f} "
@@ -249,7 +255,9 @@ def main(argv: list[str] | None = None) -> int:
         f"({report.net_ttft_delta_pct:+.1f}%), fleet breakeven hit rate {100 * report.fleet_breakeven_hit_rate:.1f}%"
     )
     if args.qps:
-        print(f"prefill GPU-seconds saved per hour at {args.qps:g} qps: {report.prefill_gpu_seconds_saved_per_hour:,.0f}")
+        print(
+            f"prefill GPU-seconds saved per hour at {args.qps:g} qps: {report.prefill_gpu_seconds_saved_per_hour:,.0f}"
+        )
     print(f"verdict: {report.verdict}")
     return 0
 

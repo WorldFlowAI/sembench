@@ -5,7 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import time
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -77,7 +77,9 @@ class LiveGatewayConfig:
     tokenizer: str | None = None
     max_items: int | None = None
     donor_max_tokens: int = 1
-    recipient_max_tokens: int = 24
+    # The quality arms score a real answer and the throughput arms report
+    # end-to-end latency at 256 output tokens; 256 is the protocol length.
+    recipient_max_tokens: int = 256
     timeout_seconds: float = 900.0
     quality_threshold: float = 0.60
     # Engines that index donors off the request path need a moment before
@@ -119,16 +121,23 @@ def run_live_gateway(config: LiveGatewayConfig) -> list[RequestMetrics]:
 def run_live_gateway_measured(config: LiveGatewayConfig) -> GatewayRunResult:
     """Replay a manifest, returning the rows and the arm's throughput document.
 
-    At ``concurrency=1`` this is the serial replay: one stream, each request
-    issued and awaited before the next, which is what the TTFT and quality
-    arms need. Above 1, requests are issued by a bounded dispatcher that still
-    submits in stream order and still holds every recipient behind its donor's
-    completion (:func:`build_stages`), so the throughput gate and the serial
-    arms replay the same sequence.
+    Every width runs the same dispatcher over the same stages, so the donor
+    gap, the post-donor settle and the stream order are enforced identically
+    whatever ``concurrency`` is. At width 1 the dispatcher is strictly
+    head-of-line -- one request issued and awaited at a time, in manifest
+    order -- which is what the TTFT and quality arms need; above 1 the run
+    also carries the throughput document the gate is read from.
     """
     items = read_jsonl(config.manifest, max_items=config.max_items)
     tokenizer = load_tokenizer(config.tokenizer)
     plan = replay_plan(items, paired=config.paired, arm=config.arm)
+    if config.paired and not any(item.donor_prompts for item in items):
+        raise ValueError(
+            "paired runs build the warm twin out of the item's donor_prompts, and no item in "
+            f"{config.manifest} carries any: the warm twin would send exactly the request the "
+            "cold twin sent and the pair would measure nothing. A self-seeding manifest is run "
+            "as two single-arm runs (--arm cold, --arm warm) joined by `sembench merge-results`"
+        )
     if config.paired and not config.reset_urls:
         raise ValueError(
             "paired gateway runs require reset_urls: without an engine cache reset "
@@ -141,102 +150,23 @@ def run_live_gateway_measured(config: LiveGatewayConfig) -> GatewayRunResult:
             "would fire while other requests are in flight and flush their KV mid-run. "
             "Run the paired/cold arms serially and the throughput arms without resets"
         )
-    if concurrency == 1:
-        return _replay_serial(config, plan, tokenizer)
-    return _replay_concurrent(config, plan, tokenizer, concurrency=concurrency)
+    return _replay_dispatched(config, plan, tokenizer, concurrency=concurrency)
 
 
-def _replay_serial(
-    config: LiveGatewayConfig,
-    plan: list[ReplayStep],
-    tokenizer,
-) -> GatewayRunResult:
-    results: list[RequestMetrics] = []
-    donor_records: list[dict[str, Any]] = []
-    recipient_records: list[dict[str, Any]] = []
-    donor_base = (config.donor_url or config.gateway_url).rstrip("/")
-    gateway_base = config.gateway_url.rstrip("/")
-    worker_urls = parse_worker_urls(config.worker_urls)
-
-    wall_start = time.perf_counter()
-    settle_seconds = 0.0
-    for step in plan:
-        item = step.item
-        donor_ids: list[str] = []
-        donor_worker_ids: list[str] = []
-        response: dict[str, Any] = {}
-        error: str | None = None
-        cache_reset = (
-            reset_engine_caches(config.reset_urls, timeout_seconds=config.timeout_seconds)
-            if config.reset_urls
-            else None
-        )
-        start = time.perf_counter()
-        try:
-            for donor in item.donor_prompts if step.seed_donors else ():
-                donor_ids.append(donor.donor_id)
-                donor_base_url = (
-                    select_worker_url(worker_urls, donor.donor_id) if worker_urls else donor_base
-                )
-                donor_worker_ids.append(donor_base_url)
-                donor_records.append(
-                    request_record(
-                        item.item_id,
-                        "donor",
-                        _donor_request(item=item, donor=donor, config=config, base_url=donor_base_url),
-                    )
-                )
-            if step.seed_donors and config.post_donor_delay_ms > 0:
-                time.sleep(config.post_donor_delay_ms / 1000)
-                settle_seconds += config.post_donor_delay_ms / 1000
-            response = _recipient_request(item=item, config=config, base_url=gateway_base)
-        except Exception as exc:
-            error = f"{type(exc).__name__}: {exc}"
-        latency_ms = (time.perf_counter() - start) * 1000
-        recipient_records.append(request_record(item.item_id, "recipient", response))
-        results.append(
-            _metrics_from_item(
-                item=item,
-                tokenizer=tokenizer,
-                config=config,
-                donor_ids=donor_ids,
-                donor_worker_ids=donor_worker_ids,
-                recipient_url=gateway_base,
-                worker_urls=worker_urls,
-                response=response,
-                latency_ms=latency_ms,
-                error=error,
-                arm=step.arm,
-                cache_reset=cache_reset,
-            )
-        )
-    wall_seconds = time.perf_counter() - wall_start
-
-    return GatewayRunResult(
-        requests=tuple(results),
-        throughput=_throughput_document(
-            config=config,
-            donor_records=donor_records,
-            recipient_records=recipient_records,
-            items=len(plan),
-            wall_seconds=wall_seconds,
-            concurrency=1,
-            max_in_flight=1,
-            gap_forced=0,
-            idle_seconds=settle_seconds,
-        ),
-        donor_records=tuple(donor_records),
-        recipient_records=tuple(recipient_records),
-    )
-
-
-def _replay_concurrent(
+def _replay_dispatched(
     config: LiveGatewayConfig,
     plan: list[ReplayStep],
     tokenizer,
     *,
     concurrency: int,
 ) -> GatewayRunResult:
+    """Replay the plan through the dispatcher at `concurrency` requests in flight.
+
+    Width 1 is the serial arm. It goes through the same stages as every other
+    width on purpose: a donor gap measured in completed requests, and a
+    post-donor settle owed only by a step that actually sent donors, are
+    properties of the stream, not of how many lanes are open.
+    """
     donor_base = (config.donor_url or config.gateway_url).rstrip("/")
     gateway_base = config.gateway_url.rstrip("/")
     worker_urls = parse_worker_urls(config.worker_urls)
@@ -248,9 +178,21 @@ def _replay_concurrent(
     # Written by the donor stage, read by that step's recipient stage, which
     # the dispatcher only releases once the donor stage has completed.
     donor_failures: dict[int, str] = {}
+    # One engine cache reset per step, fired by whichever of the step's stages
+    # runs first. Only reachable at width 1: concurrency with reset_urls is
+    # refused above, because a reset mid-flight flushes other requests' KV.
+    cache_resets: dict[int, bool] = {}
+
+    def reset_before(item_index: int) -> None:
+        if not config.reset_urls or item_index in cache_resets:
+            return
+        cache_resets[item_index] = reset_engine_caches(
+            config.reset_urls, timeout_seconds=config.timeout_seconds
+        )
 
     def execute(stage: Stage) -> dict[str, Any]:
         step = plan[stage.item_index]
+        reset_before(stage.item_index)
         if stage.kind == "donors":
             try:
                 return _send_donors(
@@ -263,9 +205,7 @@ def _replay_concurrent(
             # The serial path never sends a recipient whose donors raised.
             return {"response": {}}
         return {
-            "response": _recipient_request(
-                item=step.item, config=config, base_url=gateway_base
-            )
+            "response": _recipient_request(item=step.item, config=config, base_url=gateway_base)
         }
 
     report = run_stages(stages, execute=execute, concurrency=concurrency)
@@ -276,6 +216,7 @@ def _replay_concurrent(
         tokenizer=tokenizer,
         gateway_base=gateway_base,
         worker_urls=worker_urls,
+        cache_resets=cache_resets,
     )
 
     return GatewayRunResult(
@@ -296,7 +237,6 @@ def _replay_concurrent(
     )
 
 
-
 def _rows_from_outcomes(
     plan: list[ReplayStep],
     outcomes: Sequence[StageOutcome],
@@ -305,6 +245,7 @@ def _rows_from_outcomes(
     tokenizer,
     gateway_base: str,
     worker_urls: Sequence[str],
+    cache_resets: Mapping[int, bool] | None = None,
 ) -> tuple[list[RequestMetrics], list[dict[str, Any]], list[dict[str, Any]]]:
     """Fold the completed stages back into one row per item, in stream order.
 
@@ -343,7 +284,7 @@ def _rows_from_outcomes(
                 error=(donors.error if donors is not None else None)
                 or (recipient.error if recipient is not None else None),
                 arm=step.arm,
-                cache_reset=None,
+                cache_reset=(cache_resets or {}).get(position),
             )
         )
     return results, donor_records, recipient_records
@@ -542,11 +483,58 @@ def _first_header(headers: dict[str, str], names: Sequence[str]) -> str | None:
     return None
 
 
-def _float_or_none(value: str | None) -> float | None:
+def _float_or_none(value: Any) -> float | None:
     try:
         return float(value)  # type: ignore[arg-type]
     except (TypeError, ValueError):
         return None
+
+
+# Engine-side per-request timings, emitted by vLLM under
+# --enable-per-request-metrics. The engine's TTFT is measured from the moment
+# the request was scheduled, so it excludes queue wait -- the only TTFT that
+# stays readable once an arm runs under concurrency.
+ENGINE_TTFT_KEYS = ("time_to_first_token_ms", "ttft_ms", "time_to_first_token", "ttft")
+ENGINE_QUEUE_KEYS = ("queue_time_ms", "time_in_queue_ms", "queue_time", "time_in_queue")
+
+
+def _duration_ms(metrics: Mapping[str, Any], keys: Sequence[str]) -> float | None:
+    """First present key as milliseconds; a key without a `_ms` suffix is seconds."""
+    for key in keys:
+        value = _float_or_none(metrics.get(key))
+        if value is None:
+            continue
+        return value if key.endswith("_ms") else value * 1000
+    return None
+
+
+def _elapsed_ms(metrics: Mapping[str, Any], start_key: str, end_key: str) -> float | None:
+    """Milliseconds between two engine timestamps, or None if either is absent."""
+    start = _float_or_none(metrics.get(start_key))
+    end = _float_or_none(metrics.get(end_key))
+    if start is None or end is None or end < start:
+        return None
+    return (end - start) * 1000
+
+
+def engine_timing(response: dict[str, Any]) -> dict[str, float | None]:
+    """Engine-reported TTFT and queue wait for one request, in milliseconds.
+
+    Both stay None when the engine was not started with
+    --enable-per-request-metrics; the client-side `ttft_ms` is unaffected, but
+    under concurrency it is dominated by queue time and a TTFT ratio taken
+    from it is not the engine's.
+    """
+    metrics = response.get("metrics")
+    if not isinstance(metrics, Mapping):
+        return {"engine_ttft_ms": None, "queue_time_ms": None}
+    queue_ms = _duration_ms(metrics, ENGINE_QUEUE_KEYS)
+    if queue_ms is None:
+        queue_ms = _elapsed_ms(metrics, "arrival_time", "first_scheduled_time")
+    ttft_ms = _duration_ms(metrics, ENGINE_TTFT_KEYS)
+    if ttft_ms is None:
+        ttft_ms = _elapsed_ms(metrics, "first_scheduled_time", "first_token_time")
+    return {"engine_ttft_ms": ttft_ms, "queue_time_ms": queue_ms}
 
 
 def _chat_completion(
@@ -582,6 +570,7 @@ def _chat_completion(
     ttft_ms: float | None = None
     output: list[str] = []
     usage: dict[str, Any] = {}
+    metrics: dict[str, Any] = {}
     try:
         with urlopen(req, timeout=timeout_seconds) as resp:  # noqa: S310 - staging benchmark.
             headers = {key.lower(): value for key, value in resp.headers.items()}
@@ -600,6 +589,8 @@ def _chat_completion(
                     continue
                 if chunk.get("usage"):
                     usage = chunk["usage"]
+                if chunk.get("metrics"):
+                    metrics = chunk["metrics"]
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
                     piece = delta.get("content") or choice.get("text") or ""
@@ -621,6 +612,7 @@ def _chat_completion(
     return {
         "output_text": "".join(output),
         "usage": usage,
+        "metrics": metrics,
         "headers": headers,
         "ttft_ms": ttft_ms,
         "latency_ms": (time.perf_counter() - start) * 1000,
@@ -664,6 +656,7 @@ def _metrics_from_item(
     quality_pass = answer_score >= config.quality_threshold if answer_score is not None else None
     answer_f1 = token_f1(output_text, item.answers)
     answer_rouge = rouge_l_best(output_text, item.answers)
+    timing = engine_timing(response)
     headers = response.get("headers") or {}
     route_header = _first_header(headers, ROUTE_OUTCOME_HEADERS)
     route_worker = _first_header(headers, ROUTE_WORKER_HEADERS)
@@ -705,6 +698,8 @@ def _metrics_from_item(
         quality_f1=answer_f1,
         quality_rouge_l=answer_rouge,
         arm=arm,
+        engine_ttft_ms=timing["engine_ttft_ms"],
+        queue_time_ms=timing["queue_time_ms"],
         flush_contaminated=cold_arm_contaminated(
             arm=arm,
             cache_reset=cache_reset,

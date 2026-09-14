@@ -142,7 +142,7 @@ def test_equals_form_flags_are_parsed():
 
 def test_unbalanced_quoting_raises_rather_than_recording_an_empty_config():
     with pytest.raises(ValueError):
-        parse_serve_command("vllm serve m --kv-transfer-config '{\"a\": 1}")
+        parse_serve_command('vllm serve m --kv-transfer-config \'{"a": 1}')
 
 
 def test_phase0_serve_line_has_no_violations():
@@ -279,13 +279,19 @@ def test_run_live_gateway_records_flags_and_counter_deltas(tmp_path: Path, monke
     main(
         [
             "run-live-gateway",
-            "--manifest", str(manifest),
-            "--output", str(result),
-            "--gateway-url", "http://w0:8000",
-            "--model", "Qwen/Qwen2.5-7B-Instruct",
-            "--arm", "warm",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(result),
+            "--gateway-url",
+            "http://w0:8000",
+            "--model",
+            "Qwen/Qwen2.5-7B-Instruct",
+            "--arm",
+            "warm",
             "--skip-verify",
-            "--engine-serve-command", _PHASE0_SERVE,
+            "--engine-serve-command",
+            _PHASE0_SERVE,
         ]
     )
 
@@ -311,10 +317,14 @@ def test_run_live_gateway_records_a_null_engine_block_when_no_serve_line_given(
     main(
         [
             "run-live-gateway",
-            "--manifest", str(manifest),
-            "--output", str(result),
-            "--gateway-url", "http://w0:8000",
-            "--model", "m",
+            "--manifest",
+            str(manifest),
+            "--output",
+            str(result),
+            "--gateway-url",
+            "http://w0:8000",
+            "--model",
+            "m",
             "--skip-verify",
         ]
     )
@@ -336,12 +346,17 @@ def test_run_live_gateway_refuses_an_incomplete_serve_line_when_required(
         main(
             [
                 "run-live-gateway",
-                "--manifest", str(manifest),
-                "--output", str(tmp_path / "gateway.json"),
-                "--gateway-url", "http://w0:8000",
-                "--model", "m",
+                "--manifest",
+                str(manifest),
+                "--output",
+                str(tmp_path / "gateway.json"),
+                "--gateway-url",
+                "http://w0:8000",
+                "--model",
+                "m",
                 "--skip-verify",
-                "--engine-serve-command", "vllm serve m",
+                "--engine-serve-command",
+                "vllm serve m",
                 "--require-phase0-flags",
             ]
         )
@@ -354,9 +369,16 @@ def test_engine_metrics_urls_default_to_the_donor_and_gateway():
     args = build_parser().parse_args(
         [
             "run-live-gateway",
-            "--manifest", "m.jsonl", "--output", "o.json",
-            "--gateway-url", "http://gw:8000", "--donor-url", "http://w0:8000",
-            "--model", "m",
+            "--manifest",
+            "m.jsonl",
+            "--output",
+            "o.json",
+            "--gateway-url",
+            "http://gw:8000",
+            "--donor-url",
+            "http://w0:8000",
+            "--model",
+            "m",
         ]
     )
     assert _engine_metrics_urls(args) == ["http://w0:8000", "http://gw:8000"]
@@ -368,10 +390,18 @@ def test_engine_metrics_urls_prefer_explicit_workers():
     args = build_parser().parse_args(
         [
             "run-live-gateway",
-            "--manifest", "m.jsonl", "--output", "o.json",
-            "--gateway-url", "http://gw:8000", "--model", "m",
-            "--metrics-url", "http://w0:8000",
-            "--metrics-url", "http://w1:8000",
+            "--manifest",
+            "m.jsonl",
+            "--output",
+            "o.json",
+            "--gateway-url",
+            "http://gw:8000",
+            "--model",
+            "m",
+            "--metrics-url",
+            "http://w0:8000",
+            "--metrics-url",
+            "http://w1:8000",
         ]
     )
     assert _engine_metrics_urls(args) == ["http://w0:8000", "http://w1:8000"]
@@ -402,12 +432,18 @@ def test_engine_snapshot_and_window_commands_produce_the_engine_block(
     main(
         [
             "engine-window",
-            "--before", str(before),
-            "--after", str(after),
-            "--arm", "cold",
-            "--output", str(window),
-            "--result", str(result),
-            "--engine-serve-command", _PHASE0_SERVE,
+            "--before",
+            str(before),
+            "--after",
+            str(after),
+            "--arm",
+            "cold",
+            "--output",
+            str(window),
+            "--result",
+            str(result),
+            "--engine-serve-command",
+            _PHASE0_SERVE,
         ]
     )
 
@@ -430,9 +466,12 @@ def test_engine_window_exits_three_on_an_incomplete_serve_line(tmp_path: Path, m
         main(
             [
                 "engine-window",
-                "--before", str(before),
-                "--after", str(after),
-                "--engine-serve-command", "vllm serve m",
+                "--before",
+                str(before),
+                "--after",
+                str(after),
+                "--engine-serve-command",
+                "vllm serve m",
                 "--require-phase0-flags",
             ]
         )

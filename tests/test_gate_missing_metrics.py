@@ -71,7 +71,12 @@ def test_single_arm_result_cannot_satisfy_a_contamination_check(tmp_path: Path):
 def test_paired_result_satisfies_the_speedup_gate(tmp_path: Path, capsys):
     result = _result(
         tmp_path,
-        paired={"blended_ttft_speedup_mean": 4.8, "pairs_used": 2, "pairs_contaminated": 0},
+        paired={
+            "blended_ttft_speedup_median": 3.1,
+            "blended_ttft_speedup_mean": 4.8,
+            "pairs_used": 2,
+            "pairs_contaminated": 0,
+        },
     )
     main(
         [
@@ -146,7 +151,7 @@ def test_allow_missing_reports_what_it_skipped(tmp_path: Path, capsys):
     assert payload["passed"] is True
     assert payload["allow_missing"] is True
     assert "quality_pass_rate" in payload["missing_metrics"]
-    assert "blended_ttft_speedup" in payload["missing_metrics"]
+    assert "blended_ttft_speedup_median" in payload["missing_metrics"]
     assert payload["requested_gates"] == ["min_blended_ttft_speedup", "min_quality_pass_rate"]
 
 

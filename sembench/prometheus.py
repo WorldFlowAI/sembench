@@ -313,9 +313,8 @@ class MetricsWindow:
 
     def to_dict(self) -> dict[str, Any]:
         return {
-            "endpoints": [snapshot.url for snapshot in self.before] or [
-                snapshot.url for snapshot in self.after
-            ],
+            "endpoints": [snapshot.url for snapshot in self.before]
+            or [snapshot.url for snapshot in self.after],
             "before": [snapshot.to_dict() for snapshot in self.before],
             "after": [snapshot.to_dict() for snapshot in self.after],
             "delta": self.delta(),

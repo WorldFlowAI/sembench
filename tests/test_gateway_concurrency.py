@@ -360,9 +360,18 @@ def test_cli_parses_concurrency_gap_and_throughput_output():
     args = build_parser().parse_args(
         [
             "run-live-gateway",
-            "--manifest", "m.jsonl", "--output", "o.json",
-            "--gateway-url", "http://127.0.0.1:1", "--model", "m",
-            "--concurrency", "32", "--min-donor-gap-requests", "20",
+            "--manifest",
+            "m.jsonl",
+            "--output",
+            "o.json",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--model",
+            "m",
+            "--concurrency",
+            "32",
+            "--min-donor-gap-requests",
+            "20",
         ]
     )
     assert args.concurrency == 32
@@ -374,8 +383,14 @@ def test_cli_concurrency_defaults_to_one():
     args = build_parser().parse_args(
         [
             "run-live-gateway",
-            "--manifest", "m.jsonl", "--output", "o.json",
-            "--gateway-url", "http://127.0.0.1:1", "--model", "m",
+            "--manifest",
+            "m.jsonl",
+            "--output",
+            "o.json",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--model",
+            "m",
         ]
     )
     assert args.concurrency == 1
@@ -397,9 +412,17 @@ def test_run_live_gateway_writes_a_throughput_document_under_concurrency(tmp_pat
     main(
         [
             "run-live-gateway",
-            "--manifest", manifest, "--output", str(output),
-            "--gateway-url", "http://gateway.invalid", "--model", "qwen",
-            "--concurrency", "3", "--skip-verify",
+            "--manifest",
+            manifest,
+            "--output",
+            str(output),
+            "--gateway-url",
+            "http://gateway.invalid",
+            "--model",
+            "qwen",
+            "--concurrency",
+            "3",
+            "--skip-verify",
         ]
     )
 

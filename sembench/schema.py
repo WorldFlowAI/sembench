@@ -15,6 +15,24 @@ from typing import Any
 MANIFEST_VERSION = "sembench.manifest.v1"
 RESULT_VERSION = "sembench.result.v2"
 
+# Provenance vocabulary for RequestMetrics.external_confirmed_tokens. The two
+# sources are NOT interchangeable and the difference decides what may be said
+# about a single request.
+#
+# CONNECTOR_AUDIT — the per-request connector audit stream, joined on the
+# engine request id (B10). A genuine per-request number.
+#
+# ARM_PROMETHEUS_DELTA — the per-arm delta of ``vllm:external_prefix_cache_hits``
+# scraped before/after the arm. That counter is a process-wide total: it says
+# how much external KV the arm allocated in aggregate and cannot attribute any
+# of it to a particular request. A row stamped with this source carries an
+# ARM-LEVEL quantity, so it supports arm-level statements only — never "this
+# request reused N tokens".
+EXTERNAL_SOURCE_CONNECTOR_AUDIT = "connector_audit"
+EXTERNAL_SOURCE_ARM_PROMETHEUS = "arm_prometheus_delta"
+EXTERNAL_TOKEN_SOURCES = (EXTERNAL_SOURCE_CONNECTOR_AUDIT, EXTERNAL_SOURCE_ARM_PROMETHEUS)
+PER_REQUEST_EXTERNAL_SOURCES = (EXTERNAL_SOURCE_CONNECTOR_AUDIT,)
+
 
 @dataclass(frozen=True)
 class SourceRecord:
@@ -92,12 +110,33 @@ class RequestMetrics:
     semantic_candidate_tokens: int
     semantic_eligible_blocks: int
     semantic_eligible_tokens: int
+    # vLLM's usage.prompt_tokens_details.cached_tokens: LOCAL prefix cache plus
+    # external KV transfer, summed by the engine before it reaches the API
+    # (vllm/v1/metrics/stats.py:284). With prefix caching on, a repeated
+    # document hits the local cache and shows up here, so this field is not
+    # semantic-reuse evidence and must never be gated on as if it were.
     backend_confirmed_blocks: int | None = None
     backend_confirmed_tokens: int | None = None
     # Engine-reported fuzzy-admitted mass (cached_tokens_details["fuzzy"]).
     # On sglang's contiguous path this is a subset of backend_confirmed_tokens;
-    # on the segments path it is scatter mass NOT counted there.
+    # on the segments path it is scatter mass NOT counted there. Local prefix
+    # hits never land here, so this IS semantic-reuse evidence.
     fuzzy_confirmed_tokens: int = 0
+    # Confirmed reuse that came from the EXTERNAL KV connector only, with the
+    # local prefix cache excluded — the one number that answers "did semantic
+    # reuse happen" on a prefix-caching-on vLLM arm.
+    #
+    # None means the external split was never measured; it does NOT mean zero.
+    # Read it together with external_confirmed_tokens_source, which says
+    # whether the value is per-request or an arm-level aggregate.
+    external_confirmed_tokens: int | None = None
+    external_confirmed_tokens_source: str | None = None
+    # Engine-side TTFT from --enable-per-request-metrics, measured as
+    # (first_token_ts - scheduled_ts) and therefore excluding queue wait, plus
+    # the queue wait itself. Under concurrency, client-side ttft_ms below is
+    # dominated by queueing and is not comparable across arms; these two are.
+    engine_ttft_ms: float | None = None
+    queue_time_ms: float | None = None
     semblend_found: bool = False
     semblend_similarity: float = 0.0
     semblend_reuse_ratio: float = 0.0

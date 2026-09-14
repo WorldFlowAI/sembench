@@ -213,7 +213,9 @@ def _chunked_prefill_state(flags: dict[str, Any]) -> bool | None:
     return None
 
 
-def _cuda_graph_mode(flags: dict[str, Any], compilation: dict[str, Any] | None) -> tuple[str | None, str]:
+def _cuda_graph_mode(
+    flags: dict[str, Any], compilation: dict[str, Any] | None
+) -> tuple[str | None, str]:
     explicit = _first(flags, _CUDA_GRAPH_MODE_FLAGS)
     if isinstance(explicit, str):
         return explicit.upper(), "flag"
@@ -251,7 +253,11 @@ def parse_serve_command(
         tail = [token for token in positionals if token not in ("vllm", "serve", "python", "-m")]
         model = tail[0] if tail else None
 
-    dev_mode = str(merged_env.get("VLLM_SERVER_DEV_MODE", "")).strip().lower() in ("1", "true", "on")
+    dev_mode = str(merged_env.get("VLLM_SERVER_DEV_MODE", "")).strip().lower() in (
+        "1",
+        "true",
+        "on",
+    )
 
     return EngineFlags(
         serve_command=command if isinstance(command, str) else shlex.join(argv),
@@ -333,9 +339,11 @@ def engine_document(
     window: MetricsWindow | None = None,
 ) -> dict[str, Any]:
     """The ``engine`` block of a result document for one arm."""
-    violations = phase0_flag_violations(flags) if flags is not None else [
-        "no serve command recorded for this arm (--engine-serve-command)"
-    ]
+    violations = (
+        phase0_flag_violations(flags)
+        if flags is not None
+        else ["no serve command recorded for this arm (--engine-serve-command)"]
+    )
     document: dict[str, Any] = {
         "arm": arm,
         "flags": flags.to_dict() if flags is not None else None,

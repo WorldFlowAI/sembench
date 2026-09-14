@@ -86,8 +86,12 @@ def test_counter_value_sums_across_engine_label_sets():
 def test_counter_value_is_none_when_absent_not_zero():
     """A stock arm never registers the external counters. Reporting 0.0 would
     claim a measured miss instead of an unmeasured one."""
-    assert counter_value(parse_exposition("vllm:prompt_tokens_total 5.0\n"),
-                         "vllm:external_prefix_cache_hits") is None
+    assert (
+        counter_value(
+            parse_exposition("vllm:prompt_tokens_total 5.0\n"), "vllm:external_prefix_cache_hits"
+        )
+        is None
+    )
 
 
 def test_prompt_tokens_by_source_selects_external_kv_transfer_only():
@@ -159,8 +163,9 @@ def test_counter_deltas_skip_a_failed_scrape():
         MetricsSnapshot(
             url="http://w0/metrics",
             captured_at_utc="2026-01-01T00:00:00Z",
-            counters={key: None for key in (QUERIES_KEY, HITS_KEY,
-                                            EXTERNAL_KV_TRANSFER_TOKENS_KEY)},
+            counters={
+                key: None for key in (QUERIES_KEY, HITS_KEY, EXTERNAL_KV_TRANSFER_TOKENS_KEY)
+            },
             error="URLError: refused",
         )
     ]

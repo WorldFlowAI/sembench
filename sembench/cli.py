@@ -18,6 +18,7 @@ from sembench.engine_config import (
 from sembench.engine_events import parse_engine_events
 from sembench.gateway_live import (
     LiveGatewayConfig,
+    parse_worker_urls,
     run_live_gateway,
     run_live_gateway_measured,
 )
@@ -303,13 +304,22 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--gateway-url", required=True)
     gateway.add_argument("--model", required=True)
     gateway.add_argument("--donor-url", default=None)
+    gateway.add_argument(
+        "--worker-url",
+        action="append",
+        default=[],
+        metavar="URL",
+        help="Fleet worker endpoint donors are seeded on directly; repeat per worker (or "
+        "pass a comma-separated list). Recipients still go through --gateway-url, so what "
+        "is measured is the router's placement decision",
+    )
     gateway.add_argument("--tenant", default="tenant-a")
     gateway.add_argument("--template", default="rag-template-v1")
     gateway.add_argument("--block-size", type=int, default=16)
     gateway.add_argument("--tokenizer", default=None)
     gateway.add_argument("--max-items", type=int, default=None)
     gateway.add_argument("--donor-max-tokens", type=int, default=1)
-    gateway.add_argument("--recipient-max-tokens", type=int, default=24)
+    gateway.add_argument("--recipient-max-tokens", type=int, default=256)
     gateway.add_argument("--timeout-seconds", type=float, default=900.0)
     gateway.add_argument("--quality-threshold", type=float, default=0.60)
     gateway.add_argument("--post-donor-delay-ms", type=int, default=0)
@@ -831,6 +841,7 @@ def cmd_run_live_gateway(args) -> None:
         gateway_url=args.gateway_url,
         model=args.model,
         donor_url=args.donor_url,
+        worker_urls=parse_worker_urls(args.worker_url),
         tenant=args.tenant,
         template=args.template,
         block_size=args.block_size,
@@ -932,6 +943,11 @@ def cmd_merge_results(args) -> None:
     bytes, each item must appear exactly once per arm, and the two rows must
     carry the same manifest-derived fingerprint. Anything else is reported and
     refused rather than quietly summarized.
+
+    The cold/warm roles come from the command line, so swapping the two flags
+    would invert every speedup in the merged document without a word of
+    complaint. Each arm's own ``run.arm`` label is checked against the role it
+    was passed as, and a contradiction is refused before anything is joined.
     """
     from sembench.pairing import (
         join_arms,
@@ -939,12 +955,24 @@ def cmd_merge_results(args) -> None:
         requests_from_result,
         result_manifest_sha256,
     )
+    from sembench.results import arm_label_conflicts
 
     try:
         cold_payload = json.loads(Path(args.cold).read_text(encoding="utf-8"))
         warm_payload = json.loads(Path(args.warm).read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise SystemExit(f"merge-results: {exc}") from exc
+
+    conflicts = arm_label_conflicts(cold_payload, warm_payload)
+    if conflicts:
+        print(
+            json.dumps(
+                {"merged": False, "output": None, "arm_label_conflicts": conflicts},
+                indent=2,
+                sort_keys=True,
+            )
+        )
+        raise SystemExit(1)
 
     rows, report = join_arms(
         requests_from_result(cold_payload),
@@ -988,9 +1016,7 @@ def cmd_merge_results(args) -> None:
 
 
 def cmd_engine_snapshot(args) -> None:
-    document = snapshot_document(
-        scrape_all(list(args.metrics_url), timeout=args.timeout_seconds)
-    )
+    document = snapshot_document(scrape_all(list(args.metrics_url), timeout=args.timeout_seconds))
     encoded = json.dumps(document, indent=2, sort_keys=True)
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     Path(args.output).write_text(encoded + "\n", encoding="utf-8")
@@ -1255,14 +1281,19 @@ def cmd_assert_result_gates(args) -> None:
             "with --paired, or join two single-arm results with `sembench merge-results`",
         )
 
+    # The gate reads the MEDIAN of the paired ratios, never the mean. Speedups
+    # are ratios, so one pair whose cold arm stalled carries a mean over a
+    # threshold the typical pair never reached. The mean stays in the document
+    # as a secondary number; it is not gateable. A result that carries only the
+    # mean has no median to evaluate, and an absent metric is not a pass.
+    blended = paired.get("blended_ttft_speedup_median")
     if args.min_blended_ttft_speedup is not None:
-        blended = paired.get("blended_ttft_speedup_mean")
         require_metric(
-            "blended_ttft_speedup",
+            "blended_ttft_speedup_median",
             "min_blended_ttft_speedup",
             blended,
             lambda value: value >= args.min_blended_ttft_speedup,
-            f"{blended} < {args.min_blended_ttft_speedup}",
+            f"{blended} < {args.min_blended_ttft_speedup} (median of paired cold/warm ratios)",
         )
     if args.max_negative_control_speedup_deviation is not None:
         negative_speedup = paired.get("negative_control_ttft_speedup_mean")
@@ -1325,6 +1356,8 @@ def cmd_assert_result_gates(args) -> None:
             "engine_error_count": len(engine_errors),
             "paired_present": paired_present,
             "pairs_used": paired.get("pairs_used"),
+            "blended_ttft_speedup_median": blended,
+            "blended_ttft_speedup_mean": paired.get("blended_ttft_speedup_mean"),
         },
         "requested_gates": sorted(requested),
         "missing_metrics": sorted(set(missing_metrics)),
@@ -1359,7 +1392,9 @@ def cmd_run_load(args) -> None:
     doc = run_load(config)
     with open(args.output, "w", encoding="utf-8") as handle:
         _json.dump(doc, handle)
-    print(_json.dumps({k: v for k, v in doc.items() if k not in ("donors", "recipients")}, indent=2))
+    print(
+        _json.dumps({k: v for k, v in doc.items() if k not in ("donors", "recipients")}, indent=2)
+    )
 
 
 if __name__ == "__main__":

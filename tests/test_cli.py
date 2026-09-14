@@ -119,9 +119,16 @@ def test_live_gateway_accepts_post_donor_delay():
     args = build_parser().parse_args(
         [
             "run-live-gateway",
-            "--manifest", "m.jsonl", "--output", "o.json",
-            "--gateway-url", "http://127.0.0.1:1", "--model", "m",
-            "--post-donor-delay-ms", "2000",
+            "--manifest",
+            "m.jsonl",
+            "--output",
+            "o.json",
+            "--gateway-url",
+            "http://127.0.0.1:1",
+            "--model",
+            "m",
+            "--post-donor-delay-ms",
+            "2000",
         ]
     )
     assert args.post_donor_delay_ms == 2000

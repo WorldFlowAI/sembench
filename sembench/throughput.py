@@ -101,7 +101,9 @@ def summarize_throughput(
         "requests_per_second_excluding_settle": (
             round(n_req / served_seconds, 4) if served_seconds > 0 else None
         ),
-        "output_tokens_per_second": round(out_tokens / wall_seconds, 2) if wall_seconds > 0 else None,
+        "output_tokens_per_second": round(out_tokens / wall_seconds, 2)
+        if wall_seconds > 0
+        else None,
         "donor_ttft_ms": summarize([r["ttft_ms"] for r in donors if r.get("ttft_ms") is not None]),
         "recipient_ttft_ms": summarize(
             [r["ttft_ms"] for r in recipients if r.get("ttft_ms") is not None]
