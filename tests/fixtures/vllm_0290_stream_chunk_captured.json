@@ -1,0 +1,36 @@
+{
+  "_captured": {
+    "base_url": "http://127.0.0.1:30001",
+    "captured_at_utc": "2026-09-14T10:12:48Z",
+    "pairing_arm": "single",
+    "request_id": "sembench-single-000000-recipient-33d17aa086faa393",
+    "run_id": "phase0-a4_conn_span-20260914T101238Z",
+    "sembench_symbol": "sembench.gateway_live._chat_completion"
+  },
+  "_provenance": "CAPTURED VERBATIM off the wire. raw_sse_data is the exact SSE payload the engine sent (the text after 'data: ', unmodified); chunk is that same payload parsed. This replaces the DERIVED fixture at tests/fixtures/vllm_0290_stream_chunk.json -- when it does, the assertion in tests/test_harness_round3_runner.py that the fixture says 'DERIVED FROM SOURCE, NOT CAPTURED' has to be inverted, because that is the whole point of the replacement.",
+  "chunk": {
+    "choices": [],
+    "created": 1789380764,
+    "id": "chatcmpl-sembench-single-000000-recipient-33d17aa086faa393",
+    "metrics": {
+      "generation_time_ms": 2756.775050999977,
+      "mean_itl_ms": 918.9250169999923,
+      "queue_time_ms": 0.020990000052734104,
+      "time_to_first_token_ms": 1527.546024000003,
+      "tokens_per_second": 0.9336368423321352
+    },
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "object": "chat.completion.chunk",
+    "system_fingerprint": "vllm-0.29.0-cdace07b",
+    "usage": {
+      "completion_tokens": 4,
+      "prompt_tokens": 4030,
+      "prompt_tokens_details": {
+        "cached_tokens": 0,
+        "created_cache_tokens": 4016
+      },
+      "total_tokens": 4034
+    }
+  },
+  "raw_sse_data": "{\"id\":\"chatcmpl-sembench-single-000000-recipient-33d17aa086faa393\",\"object\":\"chat.completion.chunk\",\"created\":1789380764,\"model\":\"Qwen/Qwen2.5-7B-Instruct\",\"choices\":[],\"usage\":{\"prompt_tokens\":4030,\"total_tokens\":4034,\"completion_tokens\":4,\"prompt_tokens_details\":{\"cached_tokens\":0,\"created_cache_tokens\":4016}},\"system_fingerprint\":\"vllm-0.29.0-cdace07b\",\"metrics\":{\"time_to_first_token_ms\":1527.546024000003,\"generation_time_ms\":2756.775050999977,\"queue_time_ms\":0.020990000052734104,\"mean_itl_ms\":918.9250169999923,\"tokens_per_second\":0.9336368423321352}}"
+}

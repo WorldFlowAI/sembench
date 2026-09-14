@@ -23,9 +23,14 @@ The object's fields are ``PerRequestMetrics``
 serialized with ``exclude_none=True``, so a field whose timestamps were
 unavailable is absent rather than null.
 
-``tests/fixtures/vllm_0290_stream_chunk.json`` pins that shape. It is derived
-from the source, not captured, and must be replaced by a chunk captured during
-the E5 GPU run.
+``tests/fixtures/vllm_0290_stream_chunk_captured.json`` is that shape captured
+verbatim off the wire during the phase-0 E5 run (vLLM 0.29.0, 2026-09-14):
+``metrics`` carries the five timing fields above and ``usage.prompt_tokens_details``
+carries ``cached_tokens`` and ``created_cache_tokens`` and nothing else, so no
+per-request wire field distinguishes external (connector) KV from the engine's
+own prefix cache; that split comes only from the connector audit join.
+``tests/fixtures/vllm_0290_stream_chunk.json`` is the earlier shape derived from
+source, kept as the record of the argument; the captured chunk confirmed it.
 """
 
 from __future__ import annotations
