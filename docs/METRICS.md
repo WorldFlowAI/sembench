@@ -949,6 +949,14 @@ dropped without a count.
 
 ## Answer Quality By RoPE Delta (M6)
 
+**Multiple-choice rows (`traffic_class: longbench_v2_mc`).** Scored by exact
+letter match (`sembench.quality.exact_letter_match`): the reply's letter is
+taken from an explicit "Answer: X" line, else a line that is only a letter,
+else the first standalone A-D; `quality_score` is 1.0 or 0.0, `quality_pass`
+follows it, and `quality_f1` / `quality_rouge_l` are null on these rows
+because a single letter is a token of almost any sentence. A reply naming no
+letter scores 0.0, not null: the prompt asked for one.
+
 ```text
 quality_by_rope_delta_bucket   {"0": {...}, "128": {...}, "512": {...}, "2048": {...}}
                                per bucket: requests, mean_quality_f1,

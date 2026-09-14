@@ -10,6 +10,8 @@ Three layered metrics, all dependency-free:
 
 from __future__ import annotations
 
+import re
+
 
 def quality_score(output_text: str, answers: list[str]) -> float | None:
     """Return answer-token recall against the best reference answer."""
@@ -140,3 +142,39 @@ def _answer_recall(output_tokens: list[str], answer_tokens: list[str]) -> float:
 
 def _normalize(text: str) -> str:
     return "".join(ch.lower() if ch.isalnum() else " " for ch in text)
+
+
+_LETTER_CHOICES = "ABCD"
+_LETTER_PATTERNS = (
+    re.compile(r"(?im)^\s*(?:answer|final answer)\s*[:\-]?\s*\(?([A-D])\)?\b"),
+    re.compile(r"(?im)^\s*\(?([A-D])\)?\s*[.):]?\s*$"),
+    re.compile(r"\b([A-D])\b"),
+)
+
+
+def answer_letter(output_text: str) -> str | None:
+    """The single choice letter a multiple-choice reply names, or None.
+
+    Tried in order: an explicit "Answer: X" line, a line that is only the
+    letter, then the first standalone A-D anywhere. A reply with no letter
+    scores as wrong, never as unanswered, because the prompt asked for one.
+    """
+    for pattern in _LETTER_PATTERNS:
+        match = pattern.search(output_text or "")
+        if match:
+            return match.group(1).upper()
+    return None
+
+
+def exact_letter_match(output_text: str, answers: list[str]) -> float | None:
+    """1.0 when the reply's letter is one of the reference letters, else 0.0.
+
+    LongBench-v2 multiple-choice scoring (plan section 4, M6): exact letter
+    match, not token overlap, because a single letter is also a token of
+    almost any sentence.
+    """
+    letters = [answer.strip().upper() for answer in answers if answer and answer.strip()]
+    if not letters:
+        return None
+    found = answer_letter(output_text)
+    return 1.0 if found is not None and found in letters else 0.0

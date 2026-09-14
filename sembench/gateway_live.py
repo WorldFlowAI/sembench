@@ -16,7 +16,7 @@ from sembench.engine_metrics import engine_metrics_from_chunk, engine_timing, fl
 from sembench.exact_cache import ExactBlockIndex, full_block_tokens
 from sembench.metrics_chunk import MetricsChunkCapture, capture_for
 from sembench.pairing import COLD_ARM, SINGLE_ARM, ReplayStep, replay_plan
-from sembench.quality import quality_score, rouge_l_best, token_f1
+from sembench.quality import exact_letter_match, quality_score, rouge_l_best, token_f1
 from sembench.replay_stages import build_stages
 from sembench.request_ids import (
     RECIPIENT_ROLE,
@@ -35,6 +35,7 @@ from sembench.schema import (
 )
 from sembench.throughput import request_record, summarize_throughput
 from sembench.tokenization import load_tokenizer
+from sembench.traffic_classes import LONGBENCH_V2_MC_CLASS
 
 # Response headers a router may use to report its placement decision, most
 # specific vocabulary first. Routers disagree on names, so read all of them.
@@ -716,6 +717,16 @@ def _chat_completion(
     }
 
 
+def _is_multiple_choice(item: WorkloadItem) -> bool:
+    """A LongBench-v2 multiple-choice row: the class says so, or the builder
+    stamped the expected letter (the two always travel together)."""
+    metadata = item.metadata or {}
+    return (
+        metadata.get("traffic_class") == LONGBENCH_V2_MC_CLASS
+        or metadata.get("expected_answer_letter") is not None
+    )
+
+
 def _metrics_from_item(
     *,
     item: WorkloadItem,
@@ -749,10 +760,21 @@ def _metrics_from_item(
         else None
     )
     output_text = response.get("output_text") or ""
-    answer_score = quality_score(output_text, item.answers)
-    quality_pass = answer_score >= config.quality_threshold if answer_score is not None else None
-    answer_f1 = token_f1(output_text, item.answers)
-    answer_rouge = rouge_l_best(output_text, item.answers)
+    if _is_multiple_choice(item):
+        # M6's letter-match leg: the reply names one of A-D or it is wrong.
+        # Token F1 and ROUGE-L are not reported for these rows; a single
+        # letter is a token of almost any sentence, so they would say nothing.
+        answer_score = exact_letter_match(output_text, item.answers)
+        quality_pass = answer_score >= 1.0 if answer_score is not None else None
+        answer_f1 = None
+        answer_rouge = None
+    else:
+        answer_score = quality_score(output_text, item.answers)
+        quality_pass = (
+            answer_score >= config.quality_threshold if answer_score is not None else None
+        )
+        answer_f1 = token_f1(output_text, item.answers)
+        answer_rouge = rouge_l_best(output_text, item.answers)
     timing = engine_timing(response)
     headers = response.get("headers") or {}
     route_header = _first_header(headers, ROUTE_OUTCOME_HEADERS)

@@ -17,6 +17,8 @@ from sembench.schema import RequestMetrics
 # know them by name because two of the metrics are defined over classes, not
 # over requests: M1's opportunity denominator and M7's probe set.
 NO_REUSE_CLASS = "no_reuse"
+# LongBench-v2 multiple-choice rows (plan M6): scored by exact letter match.
+LONGBENCH_V2_MC_CLASS = "longbench_v2_mc"
 SAME_DOC_NEW_INSTRUCTION_CLASS = "same_doc_new_instruction"
 REVISED_DOC_CLASS = "revised_doc"
 ROPE_DELTA_SWEEP_CLASS = "rope_delta_sweep"
@@ -33,6 +35,7 @@ TRAFFIC_CLASSES = (
     EXACT_REPEAT_CLASS,
     PROPAGATION_PROBE_CLASS,
     REWORDED_DOC_CLASS,
+    LONGBENCH_V2_MC_CLASS,
 )
 
 # M1's alignment_given_opportunity denominator, from section 4 verbatim:
