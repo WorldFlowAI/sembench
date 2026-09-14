@@ -173,6 +173,12 @@ python -m sembench run-live-gateway \
   Donor->recipient separation, the post-donor settle and the stream order are
   enforced identically at every width, so `--min-donor-gap-requests` means the
   same thing serially and under load.
+- `--connector-audit PATH` — the SemBlend vLLM connector's audit JSONL (its
+  `audit_path` / `SEMBLEND_VLLM_AUDIT_PATH`). Joined onto the rows by request
+  id before the result is written; this is what makes M1/M2/M7 obtainable.
+  Also accepted by `merge-results`. A path that does not exist is refused
+  before the arm issues any traffic, because "the audit file was misspelled"
+  and "the arm materialized nothing" are otherwise the same null downstream.
 
 `--concurrency > 1` is refused together with `--reset-url`, and therefore with
 `--paired`: a cache reset firing mid-flight would flush the KV of requests
@@ -243,6 +249,59 @@ python -m sembench engine-window \
 its `phase0_flag_violations` / `phase0_flags_ok`, and the counter deltas under
 `prometheus.delta`. A counter that went backwards mid-arm is surfaced as
 `counter_reset_detected` instead of being clamped to zero.
+
+## Connector Audit Join (M1 / M2 / M7)
+
+Neither `/metrics` nor `cached_tokens` can say a load was *materialized* rather
+than advertised. Only the connector's audit stream can, so three of the phase-0
+metrics exist only when a result has been joined against it:
+
+```bash
+python -m sembench run-live-gateway \
+  --manifest manifests/longbench-v1-enterprise-replay.jsonl \
+  --output results/warm.json \
+  --gateway-url http://worker-0:8000 \
+  --model Qwen/Qwen2.5-7B-Instruct \
+  --run-id phase0-a4-warm \
+  --connector-audit /var/log/semblend/audit.jsonl
+```
+
+The join is by request id and nothing else. The runner derives one id per
+request from `(run_id, arm, item_id, role, stream_position)` — never a random
+one — and sends it as `X-Request-Id` and as the request body's `request_id`.
+vLLM adopts the header and builds its own id from it (`chatcmpl-<sent id>`),
+which is the id the connector writes into every audit event, so the two sides
+line up by construction rather than by inference. The id also lands on each row
+as `engine_request_id`, and `sembench.connector_audit` resolves an audited
+engine id back to the header it came from; two audited requests that normalize
+to one client id are reported as ambiguous rather than attributed to a row.
+
+Because the ids are derived, a re-run of the same manifest under the same
+`--run-id` re-derives the same ids, and an audit written on a worker joins to a
+result written anywhere else with neither side keeping a table.
+
+What the join adds to the result — always beside its own numerator and
+denominator, so `0.0` over three requests is never read as `0.0` over three
+hundred:
+
+- `boundary_alignment_rate` (M1) — among rows whose manifest says a compatible
+  donor existed, the fraction whose audited boundary landed where the manifest
+  expected. A row that only ever produced `semantic_span_boundary_missed` stays
+  in the denominator; the miss is the measurement.
+- `materialized_reuse_rate` (M2) — among rows that advertised a load, the
+  fraction that also carried `runtime_materialized`. `materialized_reuse_token_rate`
+  beside it is the spec's token-weighted form
+  (Σ materialized tokens / Σ advertised tokens). They answer different
+  questions and neither substitutes for the other.
+- `propagation_contamination_rate` (M7, the spec's "contamination /
+  propagation rate") — among `propagation_probe` rows, the fraction that
+  materialized nothing of their own yet still reported cached tokens.
+- `connector_audit_present` / `connector_audit_rows_joined`, and a
+  `config.connector_audit_join` report counting rows matched exactly, matched
+  after normalization, unmatched, ambiguous, and without an id at all.
+
+Without `--connector-audit` every one of those keys is `null`, not `0.0`: a run
+that never looked must not publish a clean score.
 
 ## Backend Audit Summaries
 
@@ -324,6 +383,15 @@ See [docs/METRICS.md](docs/METRICS.md) for the exact metric contract.
   (queue wait excluded) and the queue wait itself, from vLLM's
   `--enable-per-request-metrics`. Under concurrency these are the comparable
   numbers; client TTFT is mostly queue.
+- `latency_ms`: **service** latency — the server time the item cost, summed
+  over its donor requests and its recipient request. Since round 2 it is no
+  longer the item's wall span at any concurrency, serial included, because a
+  wall span also contains the dispatcher's own donor-gap and settle waits,
+  which are the harness's delay and not latency the engine produced. TTFT is
+  unaffected; it is still measured at the streamed first token.
+- `boundary_alignment_rate` / `materialized_reuse_rate` /
+  `propagation_contamination_rate`: M1, M2 and M7, available only on a result
+  joined against the connector audit (`--connector-audit`). `null` until then.
 - `blended_ttft_speedup_median` (+ `_ci`): the headline paired speedup and the
   number `--min-blended-ttft-speedup` gates. Speedups are ratios and ratios are
   heavy-tailed, so one stalled cold arm can carry a mean over a bar the typical
@@ -339,5 +407,24 @@ or backend audit stream reports materialization or reuse.
 
 `cached_tokens` is local prefix cache plus external transfer summed together.
 Only `external_confirmed_tokens` (external connector) and
-`fuzzy_confirmed_tokens` (SGLang fuzzy-admitted mass) are semantic reuse, and
-neither the hit rate nor any gate is computed from `cached_tokens`.
+`fuzzy_confirmed_tokens` (SGLang fuzzy-admitted mass) are semantic reuse.
+
+Two figures in the result still read `cached_tokens`. They are named here
+rather than disclaimed away, because a disclaimer that does not match the code
+is how a prefix-cache repeat gets published as semantic reuse:
+
+- **`hit_rate` is the legacy figure and must not be quoted for a vLLM run with
+  prefix caching on.** A pair that carried no semantic signal at all falls back
+  to `backend_confirmed_tokens >= 64`, and on such a run that threshold is
+  cleared by an ordinary repeated document. The strict key is
+  `hit_rate_external_confirmed`: it counts only pairs whose external split was
+  actually measured, and it is `null` — never `0.0` — until the connector audit
+  populates that split, so a gate that refuses `null` fails instead of passing
+  on prefix-cache mass. `pairs_external_confirmed` /
+  `pairs_external_unconfirmed` / `hits_unverified_external` say how many pairs
+  fell on each side.
+- **`--min-backend-confirmed-block-rate` gates `backend_confirmed_block_rate`,
+  which is `cached_tokens` in block form.** It is a coverage check on the
+  engine, not a semantic-reuse gate. The semantic figure is
+  `materialized_reuse_rate` from the connector audit join above, and nothing
+  else in this suite can stand in for it.

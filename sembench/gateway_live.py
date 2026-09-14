@@ -12,10 +12,19 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from sembench.dispatch import Stage, StageOutcome, run_stages
+from sembench.engine_metrics import engine_metrics_from_chunk, engine_timing, float_or_none
 from sembench.exact_cache import ExactBlockIndex, full_block_tokens
 from sembench.pairing import COLD_ARM, SINGLE_ARM, ReplayStep, replay_plan
 from sembench.quality import quality_score, rouge_l_best, token_f1
 from sembench.replay_stages import build_stages
+from sembench.request_ids import (
+    RECIPIENT_ROLE,
+    current_request_id,
+    deterministic_request_id,
+    donor_role,
+    sending_request_id,
+    stamp_request_id,
+)
 from sembench.schema import RequestMetrics, WorkloadItem, read_jsonl
 from sembench.throughput import request_record, summarize_throughput
 from sembench.tokenization import load_tokenizer
@@ -69,6 +78,10 @@ class LiveGatewayConfig:
     output: str
     gateway_url: str
     model: str
+    # Identity of the run every request id is derived from. Empty still yields
+    # valid ids, but two runs appending to one audit file would then derive the
+    # same ids for the same items, so the CLI always passes the real run id.
+    run_id: str = ""
     donor_url: str | None = None
     worker_urls: tuple[str, ...] = ()
     tenant: str = "tenant-a"
@@ -196,7 +209,12 @@ def _replay_dispatched(
         if stage.kind == "donors":
             try:
                 return _send_donors(
-                    step.item, config=config, donor_base=donor_base, worker_urls=worker_urls
+                    step.item,
+                    config=config,
+                    donor_base=donor_base,
+                    worker_urls=worker_urls,
+                    arm=step.arm,
+                    stream_position=stage.item_index,
                 )
             except Exception as exc:
                 donor_failures[stage.item_index] = f"{type(exc).__name__}: {exc}"
@@ -204,9 +222,17 @@ def _replay_dispatched(
         if stage.item_index in donor_failures:
             # The serial path never sends a recipient whose donors raised.
             return {"response": {}}
-        return {
-            "response": _recipient_request(item=step.item, config=config, base_url=gateway_base)
-        }
+        with sending_request_id(
+            _recipient_request_id(
+                config=config,
+                arm=step.arm,
+                item_id=step.item.item_id,
+                stream_position=stage.item_index,
+            )
+        ):
+            return {
+                "response": _recipient_request(item=step.item, config=config, base_url=gateway_base)
+            }
 
     report = run_stages(stages, execute=execute, concurrency=concurrency)
     results, donor_records, recipient_records = _rows_from_outcomes(
@@ -270,24 +296,61 @@ def _rows_from_outcomes(
             request_record(step.item.item_id, "donor", one) for one in donor_responses
         )
         recipient_records.append(request_record(step.item.item_id, "recipient", response))
+        row = _metrics_from_item(
+            item=step.item,
+            tokenizer=tokenizer,
+            config=config,
+            donor_ids=list(donor_value.get("donor_ids") or []),
+            donor_worker_ids=list(donor_value.get("worker_ids") or []),
+            recipient_url=gateway_base,
+            worker_urls=worker_urls,
+            response=response,
+            latency_ms=_service_latency_ms(donor_responses, response),
+            error=(donors.error if donors is not None else None)
+            or (recipient.error if recipient is not None else None),
+            arm=step.arm,
+            cache_reset=(cache_resets or {}).get(position),
+        )
         results.append(
-            _metrics_from_item(
-                item=step.item,
-                tokenizer=tokenizer,
-                config=config,
-                donor_ids=list(donor_value.get("donor_ids") or []),
-                donor_worker_ids=list(donor_value.get("worker_ids") or []),
-                recipient_url=gateway_base,
-                worker_urls=worker_urls,
-                response=response,
-                latency_ms=_service_latency_ms(donor_responses, response),
-                error=(donors.error if donors is not None else None)
-                or (recipient.error if recipient is not None else None),
-                arm=step.arm,
-                cache_reset=(cache_resets or {}).get(position),
+            stamp_request_id(
+                row,
+                _recipient_request_id(
+                    config=config,
+                    arm=step.arm,
+                    item_id=step.item.item_id,
+                    stream_position=position,
+                ),
             )
         )
     return results, donor_records, recipient_records
+
+
+def _recipient_request_id(
+    *,
+    config: LiveGatewayConfig,
+    arm: str,
+    item_id: str,
+    stream_position: int,
+) -> str:
+    """The ``X-Request-Id`` this runner sends for one item's recipient.
+
+    This exact string, not the engine's prefixed form of it, is what lands on
+    the row: ``sembench.connector_audit`` resolves an audited engine id back to
+    the header it came from, and a row that claimed the prefixed form would be
+    asserting something about the engine that the harness did not observe.
+
+    A gateway that strips or rewrites the header therefore shows up as
+    unjoinable rows, counted in the result's
+    ``config.connector_audit_join.rows_unmatched`` -- not as a silently empty
+    set of audit-derived metrics.
+    """
+    return deterministic_request_id(
+        run_id=config.run_id,
+        arm=arm,
+        item_id=item_id,
+        role=RECIPIENT_ROLE,
+        stream_position=stream_position,
+    )
 
 
 def _send_donors(
@@ -296,15 +359,30 @@ def _send_donors(
     config: LiveGatewayConfig,
     donor_base: str,
     worker_urls: Sequence[str],
+    arm: str = SINGLE_ARM,
+    stream_position: int = 0,
 ) -> dict[str, Any]:
     donor_ids: list[str] = []
     worker_ids: list[str] = []
     responses: list[dict[str, Any]] = []
-    for donor in item.donor_prompts:
+    for index, donor in enumerate(item.donor_prompts):
         base_url = select_worker_url(worker_urls, donor.donor_id) if worker_urls else donor_base
         donor_ids.append(donor.donor_id)
         worker_ids.append(base_url)
-        responses.append(_donor_request(item=item, donor=donor, config=config, base_url=base_url))
+        # Donors get their own ids so a capture event in the audit is
+        # attributable to the request that seeded it, not just to the item.
+        with sending_request_id(
+            deterministic_request_id(
+                run_id=config.run_id,
+                arm=arm,
+                item_id=item.item_id,
+                role=donor_role(index),
+                stream_position=stream_position,
+            )
+        ):
+            responses.append(
+                _donor_request(item=item, donor=donor, config=config, base_url=base_url)
+            )
     return {"donor_ids": donor_ids, "worker_ids": worker_ids, "responses": responses}
 
 
@@ -483,60 +561,6 @@ def _first_header(headers: dict[str, str], names: Sequence[str]) -> str | None:
     return None
 
 
-def _float_or_none(value: Any) -> float | None:
-    try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError):
-        return None
-
-
-# Engine-side per-request timings, emitted by vLLM under
-# --enable-per-request-metrics. The engine's TTFT is measured from the moment
-# the request was scheduled, so it excludes queue wait -- the only TTFT that
-# stays readable once an arm runs under concurrency.
-ENGINE_TTFT_KEYS = ("time_to_first_token_ms", "ttft_ms", "time_to_first_token", "ttft")
-ENGINE_QUEUE_KEYS = ("queue_time_ms", "time_in_queue_ms", "queue_time", "time_in_queue")
-
-
-def _duration_ms(metrics: Mapping[str, Any], keys: Sequence[str]) -> float | None:
-    """First present key as milliseconds; a key without a `_ms` suffix is seconds."""
-    for key in keys:
-        value = _float_or_none(metrics.get(key))
-        if value is None:
-            continue
-        return value if key.endswith("_ms") else value * 1000
-    return None
-
-
-def _elapsed_ms(metrics: Mapping[str, Any], start_key: str, end_key: str) -> float | None:
-    """Milliseconds between two engine timestamps, or None if either is absent."""
-    start = _float_or_none(metrics.get(start_key))
-    end = _float_or_none(metrics.get(end_key))
-    if start is None or end is None or end < start:
-        return None
-    return (end - start) * 1000
-
-
-def engine_timing(response: dict[str, Any]) -> dict[str, float | None]:
-    """Engine-reported TTFT and queue wait for one request, in milliseconds.
-
-    Both stay None when the engine was not started with
-    --enable-per-request-metrics; the client-side `ttft_ms` is unaffected, but
-    under concurrency it is dominated by queue time and a TTFT ratio taken
-    from it is not the engine's.
-    """
-    metrics = response.get("metrics")
-    if not isinstance(metrics, Mapping):
-        return {"engine_ttft_ms": None, "queue_time_ms": None}
-    queue_ms = _duration_ms(metrics, ENGINE_QUEUE_KEYS)
-    if queue_ms is None:
-        queue_ms = _elapsed_ms(metrics, "arrival_time", "first_scheduled_time")
-    ttft_ms = _duration_ms(metrics, ENGINE_TTFT_KEYS)
-    if ttft_ms is None:
-        ttft_ms = _elapsed_ms(metrics, "first_scheduled_time", "first_token_time")
-    return {"engine_ttft_ms": ttft_ms, "queue_time_ms": queue_ms}
-
-
 def _chat_completion(
     *,
     base_url: str,
@@ -547,23 +571,33 @@ def _chat_completion(
     template: str,
     timeout_seconds: float,
 ) -> dict[str, Any]:
-    payload = {
+    # Set by the runner for the request being issued on this thread. Sent as a
+    # header (which vLLM prefers) and as a body field (which survives a front
+    # end that strips unknown headers) -- see sembench.request_ids.
+    request_id = current_request_id()
+    payload: dict[str, Any] = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
         "temperature": 0,
         "max_tokens": max_tokens,
         "stream": True,
+        # Per-request metrics ride on the final usage chunk and are emitted
+        # only when usage reporting is on, so this is not optional.
         "stream_options": {"include_usage": True},
     }
+    request_headers = {
+        "Content-Type": "application/json",
+        "x-tenant-id": tenant,
+        "x-tokenizer-id": model,
+        "x-chat-template-id": template,
+    }
+    if request_id:
+        payload["request_id"] = request_id
+        request_headers["X-Request-Id"] = request_id
     req = Request(
         f"{base_url}/v1/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "x-tenant-id": tenant,
-            "x-tokenizer-id": model,
-            "x-chat-template-id": template,
-        },
+        headers=request_headers,
         method="POST",
     )
     start = time.perf_counter()
@@ -571,6 +605,7 @@ def _chat_completion(
     output: list[str] = []
     usage: dict[str, Any] = {}
     metrics: dict[str, Any] = {}
+    response_id: str | None = None
     try:
         with urlopen(req, timeout=timeout_seconds) as resp:  # noqa: S310 - staging benchmark.
             headers = {key.lower(): value for key, value in resp.headers.items()}
@@ -587,10 +622,13 @@ def _chat_completion(
                     chunk = json.loads(text)
                 except json.JSONDecodeError:
                     continue
+                if response_id is None and chunk.get("id"):
+                    response_id = str(chunk["id"])
                 if chunk.get("usage"):
                     usage = chunk["usage"]
-                if chunk.get("metrics"):
-                    metrics = chunk["metrics"]
+                chunk_metrics = engine_metrics_from_chunk(chunk)
+                if chunk_metrics is not None:
+                    metrics = dict(chunk_metrics)
                 for choice in chunk.get("choices") or []:
                     delta = choice.get("delta") or {}
                     piece = delta.get("content") or choice.get("text") or ""
@@ -603,11 +641,13 @@ def _chat_completion(
         return {
             "error": f"HTTP {exc.code}: {body}",
             "latency_ms": (time.perf_counter() - start) * 1000,
+            "request_id": request_id,
         }
     except URLError as exc:
         return {
             "error": str(exc.reason),
             "latency_ms": (time.perf_counter() - start) * 1000,
+            "request_id": request_id,
         }
     return {
         "output_text": "".join(output),
@@ -616,6 +656,10 @@ def _chat_completion(
         "headers": headers,
         "ttft_ms": ttft_ms,
         "latency_ms": (time.perf_counter() - start) * 1000,
+        "request_id": request_id,
+        # The engine's own id for this request, echoed on every chunk. This,
+        # not the id that was sent, is what the connector audit recorded.
+        "response_id": response_id,
     }
 
 
@@ -660,7 +704,7 @@ def _metrics_from_item(
     headers = response.get("headers") or {}
     route_header = _first_header(headers, ROUTE_OUTCOME_HEADERS)
     route_worker = _first_header(headers, ROUTE_WORKER_HEADERS)
-    route_similarity = _float_or_none(_first_header(headers, ROUTE_SIMILARITY_HEADERS))
+    route_similarity = float_or_none(_first_header(headers, ROUTE_SIMILARITY_HEADERS))
     # A recipient sent straight at a worker identifies its server by URL; behind
     # a gateway only the router can say, so absent the header this stays None.
     direct_worker = recipient_url if recipient_url in tuple(worker_urls) else None

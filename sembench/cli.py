@@ -137,20 +137,79 @@ def _add_engine_config_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _engine_metrics_urls(args) -> list[str]:
-    """Endpoints to scrape for this arm, deduped and order-preserving."""
+    """Endpoints to scrape for this arm, deduped and order-preserving.
+
+    Every source goes through ``parse_worker_urls``, which is what makes the
+    comma-separated form ``--worker-url`` advertises work here too. Splicing
+    the raw argv values in instead produced a single scrape target literally
+    named ``http://a:8000,http://b:8000``: the run then scraped nothing, the
+    engine counter window came back empty, and the arm looked like an engine
+    that reports no external-KV counters rather than like a client bug.
+    """
     if args.metrics_url:
-        candidates = list(args.metrics_url)
-    else:
-        candidates = [
-            *(getattr(args, "worker_url", None) or []),
-            getattr(args, "donor_url", None),
-            getattr(args, "gateway_url", None),
-        ]
-    urls: list[str] = []
-    for url in candidates:
-        if url and url not in urls:
-            urls.append(url)
-    return urls
+        return list(parse_worker_urls(args.metrics_url))
+    return list(
+        parse_worker_urls(
+            [
+                *(getattr(args, "worker_url", None) or []),
+                getattr(args, "donor_url", None) or "",
+                getattr(args, "gateway_url", None) or "",
+            ]
+        )
+    )
+
+
+def _add_connector_audit_arg(parser: argparse.ArgumentParser) -> None:
+    """The connector audit JSONL this result is to be joined against.
+
+    The audit is the only artifact that can say a load was *materialized*
+    rather than advertised, so M1/M2/M7 are unobtainable without it.
+    """
+    parser.add_argument(
+        "--connector-audit",
+        default=None,
+        metavar="PATH",
+        help="SemBlend vLLM connector audit JSONL (the connector's audit_path) to join this "
+        "result against by request_id; source of boundary_alignment_rate (M1), "
+        "materialized_reuse_rate (M2) and propagation_rate (M7)",
+    )
+
+
+def _connector_audit_or_exit(args) -> str | None:
+    """The audit path, checked to exist before an arm spends any GPU time.
+
+    A mistyped path is otherwise indistinguishable downstream from an arm that
+    genuinely produced no materialization events, and that confusion reads as
+    a clean zero rather than as a missing measurement.
+    """
+    path = getattr(args, "connector_audit", None)
+    if not path:
+        return None
+    if not Path(path).is_file():
+        raise SystemExit(
+            f"connector audit: {path} does not exist. Point --connector-audit at the file the "
+            "connector's audit_path / SEMBLEND_VLLM_AUDIT_PATH writes, or drop the flag; a "
+            "missing audit is not an arm with no materialization"
+        )
+    return str(path)
+
+
+def _join_connector_audit(requests: list, connector_audit: str | None) -> tuple[list, dict | None]:
+    """Stamp the audit's facts onto the rows before the result is written.
+
+    Returns the rows and the join report. With no audit the rows pass through
+    untouched and every audit-derived metric stays null, which is the honest
+    reading of a run that measured nothing rather than a zero.
+    """
+    if not connector_audit:
+        return list(requests), None
+    from sembench.connector_audit import AuditError, join_audit_file
+
+    try:
+        joined, report = join_audit_file(requests, connector_audit)
+    except AuditError as exc:
+        raise SystemExit(f"connector audit: {exc}") from exc
+    return list(joined), report.to_dict()
 
 
 def _engine_flags_or_exit(args):
@@ -360,6 +419,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Engine cache-reset endpoint POSTed before each arm; repeat per worker "
         "(vLLM: http://host:8000/reset_prefix_cache?reset_external=true)",
     )
+    _add_connector_audit_arg(gateway)
 
     merge = sub.add_parser(
         "merge-results",
@@ -375,6 +435,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Merge anyway when the arms do not join one-to-one (the pairing report still "
         "records every unpaired row; the paired summary is then a subset, not the run)",
     )
+    _add_connector_audit_arg(merge)
 
     load = sub.add_parser(
         "run-load",
@@ -834,12 +895,18 @@ def cmd_run_live_gateway(args) -> None:
             "VLLM_SERVER_DEV_MODE=1 and pass "
             "--reset-url http://<worker>/reset_prefix_cache?reset_external=true"
         )
+    connector_audit = _connector_audit_or_exit(args)
     detected_version = _preflight(args, engine="gateway", base_url=args.gateway_url)
+    # Resolved before the config, not at write time: the runner derives every
+    # X-Request-Id from this id, and a run whose result says one run id while
+    # its requests were stamped with another cannot be joined to its audit.
+    run_metadata = _run_metadata(args, engine="gateway", engine_version=detected_version)
     config = LiveGatewayConfig(
         manifest=args.manifest,
         output=args.output,
         gateway_url=args.gateway_url,
         model=args.model,
+        run_id=run_metadata.run_id,
         donor_url=args.donor_url,
         worker_urls=parse_worker_urls(args.worker_url),
         tenant=args.tenant,
@@ -875,16 +942,19 @@ def cmd_run_live_gateway(args) -> None:
     # variant; a plain serial arm is the same replay either way.
     wants_throughput = args.concurrency > 1 or bool(args.throughput_output)
     run = run_live_gateway_measured(config) if wants_throughput else None
-    requests = list(run.requests) if run is not None else run_live_gateway(config)
+    replayed = list(run.requests) if run is not None else run_live_gateway(config)
     after = tuple(scrape_all(metrics_urls))
+    requests, audit_join = _join_connector_audit(replayed, connector_audit)
     write_result(
         args.output,
         requests=requests,
         config={
             "mode": "live-gateway",
             **config.__dict__,
+            "connector_audit": connector_audit,
+            "connector_audit_join": audit_join,
         },
-        run=_run_metadata(args, engine="gateway", engine_version=detected_version),
+        run=run_metadata,
         engine=engine_document(
             arm=args.arm,
             flags=engine_flags,
@@ -957,6 +1027,7 @@ def cmd_merge_results(args) -> None:
     )
     from sembench.results import arm_label_conflicts
 
+    connector_audit = _connector_audit_or_exit(args)
     try:
         cold_payload = json.loads(Path(args.cold).read_text(encoding="utf-8"))
         warm_payload = json.loads(Path(args.warm).read_text(encoding="utf-8"))
@@ -990,15 +1061,18 @@ def cmd_merge_results(args) -> None:
         )
         raise SystemExit(1)
 
+    joined_rows, audit_join = _join_connector_audit(rows, connector_audit)
     write_result(
         args.output,
-        requests=rows,
+        requests=joined_rows,
         config={
             "mode": "merge-results",
             "cold_result": args.cold,
             "warm_result": args.warm,
             "allow_unpaired": bool(args.allow_unpaired),
             "pairing": report.to_dict(),
+            "connector_audit": connector_audit,
+            "connector_audit_join": audit_join,
             "arms": {
                 "cold": _arm_provenance(cold_payload),
                 "warm": _arm_provenance(warm_payload),

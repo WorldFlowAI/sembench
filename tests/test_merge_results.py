@@ -14,7 +14,7 @@ import pytest
 
 from sembench.cli import main
 from sembench.pairing import join_arms, pair_fingerprint, requests_from_result
-from sembench.schema import RequestMetrics
+from sembench.schema import EXTERNAL_SOURCE_CONNECTOR_AUDIT, RequestMetrics
 
 MANIFEST_SHA = "a" * 64
 
@@ -45,6 +45,14 @@ def _row(item_id: str, *, ttft: float, cached: int, arm: str = "single", **kw) -
     return RequestMetrics(**fields)
 
 
+def _external(tokens: int) -> dict:
+    """The per-request external split, as the connector-audit join stamps it."""
+    return {
+        "external_confirmed_tokens": tokens,
+        "external_confirmed_tokens_source": EXTERNAL_SOURCE_CONNECTOR_AUDIT,
+    }
+
+
 def _write_result(path: Path, rows, *, sha: str = MANIFEST_SHA, run_id: str = "r") -> Path:
     path.write_text(
         json.dumps(
@@ -73,9 +81,15 @@ def _arms(tmp_path: Path, *, cold_sha: str = MANIFEST_SHA, warm_sha: str = MANIF
         sha=cold_sha,
         run_id="cold-run",
     )
+    # The warm arm carries the external split the connector audit supplies:
+    # `cached` alone is local prefix cache + external transfer, so a hit
+    # judged on it is not evidence that anything semantic happened.
     warm = _write_result(
         tmp_path / "warm.json",
-        [_row("i1", ttft=40.0, cached=96), _row("i2", ttft=42.0, cached=96)],
+        [
+            _row("i1", ttft=40.0, cached=96, **_external(96)),
+            _row("i2", ttft=42.0, cached=96, **_external(96)),
+        ],
         sha=warm_sha,
         run_id="warm-run",
     )
@@ -95,6 +109,9 @@ def test_merge_produces_a_paired_summary_from_two_single_arm_results(tmp_path: P
         ((200.0 / 40.0) + (210.0 / 42.0)) / 2
     )
     assert merged["paired"]["hit_rate"] == 1.0
+    # ... and the hit is confirmed on external mass, not on cached_tokens.
+    assert merged["paired"]["hit_rate_external_confirmed"] == 1.0
+    assert merged["paired"]["pairs_external_unconfirmed"] == 0
     assert [(row["item_id"], row["arm"]) for row in merged["requests"]] == [
         ("i1", "cold"),
         ("i1", "warm"),

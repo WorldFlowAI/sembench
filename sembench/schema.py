@@ -131,6 +131,43 @@ class RequestMetrics:
     # whether the value is per-request or an arm-level aggregate.
     external_confirmed_tokens: int | None = None
     external_confirmed_tokens_source: str | None = None
+    # The id the runner put in the request's X-Request-Id header, which vLLM
+    # adopts as the engine request id (see sembench.connector_audit for the
+    # exact vLLM call sites and the prefix/suffix it adds). This is the join
+    # key to the connector's audit stream; without it the audit cannot be
+    # attributed to a row and every audit-derived field below stays null.
+    engine_request_id: str | None = None
+    # Manifest expectations for this item, stamped from WorkloadItem.metadata.
+    # They are pure functions of the tokenizer and the connector's own
+    # block_align_spans/supply_at_boundary, so they can be precomputed and
+    # asserted against what the engine actually did. expected_supplied_tokens
+    # > 0 is the statement "a compatible donor existed for this request" and is
+    # the denominator of the boundary-alignment rate; None means the manifest
+    # made no claim, which is not the same as a claim of zero.
+    expected_supplied_tokens: int | None = None
+    expected_span_target_start: int | None = None
+    # Traffic class from the manifest (no_reuse, same_doc_new_instruction,
+    # propagation_probe, ...). Falls back to `transform` when the manifest
+    # carries the class there instead.
+    traffic_class: str | None = None
+    # Connector-audit join results (sembench.connector_audit.join_requests).
+    # audit_joined tri-states on purpose: None means no audit was joined at
+    # all, False means the audit was read and held nothing for this request,
+    # True means these fields are measurements. A rate computed over rows
+    # whose audit_joined is None is a rate over nothing and must be null.
+    audit_joined: bool | None = None
+    # The boundary the connector actually saw, from the LAST advertise for
+    # this request, or from the last boundary-missed event when nothing was
+    # ever advertised.
+    audit_observed_boundary: int | None = None
+    audit_advertised_tokens: int | None = None
+    audit_advertised_target_start: int | None = None
+    # Did the observed boundary coincide with a snapped span's start? None
+    # when no advertise carried spans to compare against.
+    audit_boundary_at_span_start: bool | None = None
+    audit_load_allocated: bool | None = None
+    audit_materialized: bool | None = None
+    audit_declined_reasons: list[str] | None = None
     # Engine-side TTFT from --enable-per-request-metrics, measured as
     # (first_token_ts - scheduled_ts) and therefore excluding queue wait, plus
     # the queue wait itself. Under concurrency, client-side ttft_ms below is

@@ -1,0 +1,39 @@
+{
+  "_provenance": "DERIVED FROM SOURCE, NOT CAPTURED. Hand-built from the vLLM 0.29.0 tree by reading the serializers listed in _source; no vLLM server has produced this exact payload. REPLACE IT with a chunk captured verbatim off the wire during the E5 GPU run, and re-run tests/test_harness_round3_runner.py: if the captured chunk still parses, the derived shape was right, and if it does not, this file was the assumption that hid the difference.",
+  "_source": {
+    "chunk_model": "vllm/entrypoints/openai/chat_completion/protocol.py:165-180 (ChatCompletionStreamResponse; `metrics: PerRequestMetrics | None` at :180)",
+    "chunk_emission": "vllm/entrypoints/openai/chat_completion/serving.py:817-870 (metrics ride on the FINAL usage chunk only, serialized with exclude_unset=True, exclude_none=True)",
+    "metrics_model": "vllm/entrypoints/generate/base/protocol.py:55-62 (PerRequestMetrics)",
+    "metrics_builder": "vllm/entrypoints/generate/base/serving.py:50-95 (time_to_first_token_ms = (first_token_ts - scheduled_ts)*1000, queue_time_ms = (scheduled_ts - queued_ts)*1000)",
+    "usage_model": "vllm/entrypoints/serve/engine/protocol.py:110-115 (UsageInfo) and chat_completion/serving.py:90-109 (prompt_tokens_details)",
+    "request_id": "vllm/entrypoints/openai/chat_completion/serving.py:281-283 (id = chatcmpl-<X-Request-Id>) and vllm/entrypoints/serve/engine/serving.py:117-126"
+  },
+  "_preconditions": [
+    "server started with --enable-per-request-metrics (and therefore not --disable-log-stats)",
+    "server started with --enable-prompt-tokens-details for usage.prompt_tokens_details",
+    "request sent stream_options.include_usage=true, without which no final usage chunk is emitted and the metrics object never appears",
+    "request asked for a single completion; n > 1 suppresses the metrics object (chat_completion/serving.py:841-842)"
+  ],
+  "chunk": {
+    "id": "chatcmpl-sembench-warm-000012-recipient-1f0c7a4d9b2e6503",
+    "object": "chat.completion.chunk",
+    "created": 1773100800,
+    "model": "Qwen/Qwen2.5-7B-Instruct",
+    "choices": [],
+    "usage": {
+      "prompt_tokens": 4096,
+      "completion_tokens": 256,
+      "total_tokens": 4352,
+      "prompt_tokens_details": {
+        "cached_tokens": 3072
+      }
+    },
+    "metrics": {
+      "time_to_first_token_ms": 412.7,
+      "generation_time_ms": 3180.4,
+      "queue_time_ms": 18.2,
+      "mean_itl_ms": 12.472,
+      "tokens_per_second": 71.3
+    }
+  }
+}

@@ -1,7 +1,8 @@
 import asyncio
+from dataclasses import replace
 
 from sembench.results import paired_summary
-from sembench.schema import DonorPrompt, WorkloadItem
+from sembench.schema import EXTERNAL_SOURCE_CONNECTOR_AUDIT, DonorPrompt, WorkloadItem
 from sembench.sglang_live import LiveSglangConfig, replay_items
 from sembench.tokenization import load_tokenizer
 
@@ -62,6 +63,26 @@ def _item(item_id: str = "i1") -> WorkloadItem:
         recipient_prompt="recipient prompt " * 12,
         answers=["42 minutes"],
     )
+
+
+def _with_external_split(rows):
+    """Stamp the warm rows with the external split the audit join supplies.
+
+    The fake transport speaks the engine's `cached_tokens`, which is local
+    prefix cache + external transfer; a hit judged on that number is not
+    evidence of semantic reuse, so the warm twin carries the connector-audit
+    value the real join would have written.
+    """
+    return [
+        replace(
+            row,
+            external_confirmed_tokens=96,
+            external_confirmed_tokens_source=EXTERNAL_SOURCE_CONNECTOR_AUDIT,
+        )
+        if row.arm == "warm"
+        else row
+        for row in rows
+    ]
 
 
 def _run(config: LiveSglangConfig, transport: FakeTransport, items=None):
@@ -137,12 +158,13 @@ def test_negative_control_pairs_tracked_separately():
         negative_control=True,
     )
     rows = _run(_config(paired=True), FakeTransport(), items=[_item(), neg])
-    summary = paired_summary(rows)
+    summary = paired_summary(_with_external_split(rows))
     assert summary["negative_control_pairs"] == 1
-    # regular pair: 200/40 = 5.0 blended; hit (cached_tokens 96 >= 64-token
-    # reuse threshold) → hit_rate 1.0
+    # regular pair: 200/40 = 5.0 blended; hit (96 external-confirmed tokens
+    # >= the 64-token reuse threshold) → hit_rate 1.0
     assert summary["blended_ttft_speedup_mean"] == 5.0
     assert summary["hit_rate"] == 1.0
+    assert summary["hit_rate_external_confirmed"] == 1.0
     assert summary["hit_only_ttft_speedup_mean"] == 5.0
     # FakeTransport warms every seeded recipient, so the neg control also
     # speeds up — exactly what the deviation gate exists to catch.

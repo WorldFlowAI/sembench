@@ -96,16 +96,36 @@ fuzzy_confirmed_tokens     SGLang fuzzy-admitted mass; a local prefix hit never
 `backend_confirmed_tokens` is populated from
 `usage.prompt_tokens_details.cached_tokens`. With prefix caching on, replaying
 the same document hits the local cache and inflates that field without any
-connector involvement, so **it must never be gated on as semantic reuse**. The
-hit rate, `reuse_mechanism`, and every speedup gate read
-`external_confirmed_tokens` and `fuzzy_confirmed_tokens` instead; the
-prefix-cache bucket (`exact`) is deliberately excluded from the semantic
-mechanisms.
+connector involvement, so **it must never be gated on as semantic reuse**.
+`reuse_mechanism` and every speedup gate read `external_confirmed_tokens` and
+`fuzzy_confirmed_tokens` instead; the prefix-cache bucket (`exact`) is
+deliberately excluded from the semantic mechanisms.
+
+Two figures in the result do still read `cached_tokens`, and both are stated
+here rather than disclaimed, because a disclaimer the code does not honour is
+how prefix-cache mass gets published as semantic reuse:
+
+| Figure | What it actually reads | Quotable as semantic reuse? |
+| --- | --- | --- |
+| `hit_rate_external_confirmed` | `semantic_reuse_tokens` only — `external_confirmed_tokens` or `fuzzy_confirmed_tokens`, over the pairs that carried one | **Yes.** This is the strict key. |
+| `hit_rate` | the same, but a pair with no semantic signal at all falls back to `backend_confirmed_tokens >= 64` (`REUSE_HIT_THRESHOLD_TOKENS`) | **No.** Legacy figure. |
+| `backend_confirmed_block_rate` (gated by `--min-backend-confirmed-block-rate`) | `cached_tokens` in block form | **No.** Engine coverage check. |
+| `materialized_reuse_rate` | `runtime_materialized` events from the connector audit | **Yes**, and it is the only figure that proves materialization. |
+
+**`hit_rate` must not be quoted for a vLLM run with prefix caching on.** On
+such a run the legacy fallback is cleared by an ordinary repeated document, so
+the number is a prefix-cache hit rate wearing a semantic name. Quote
+`hit_rate_external_confirmed`, and report `pairs_external_confirmed` /
+`pairs_external_unconfirmed` / `hits_unverified_external` beside it so the
+reader can see how many pairs could be judged at all.
 
 `external_confirmed_tokens is None` means the split was never measured. It does
 **not** mean zero, and it is not counted as a miss: `hit_rate_external_confirmed`
 is `None` — not `0.0` — when no pair carried the split, so a gate that refuses
-`None` fails instead of passing on prefix-cache mass.
+`None` fails instead of passing on prefix-cache mass. The one exception is a
+row the connector audit *did* join and that carried no `runtime_materialized`:
+there the audit looked and found nothing, so the row counts as a confirmed
+miss (0) rather than as unmeasured.
 
 `external_confirmed_tokens_source` records where the number came from, because
 the two sources support different claims:
@@ -121,8 +141,8 @@ two the run actually carried.
 ## Engine-Side TTFT
 
 With vLLM's `--enable-per-request-metrics` (phase 0 requires it; note it cannot
-be combined with `--disable-log-stats`), each streamed response carries a
-`metrics` chunk, and the runner splits it into two fields:
+be combined with `--disable-log-stats`), a streamed chat completion carries a
+top-level `metrics` object, and the runner splits it into two fields:
 
 ```text
 engine_ttft_ms   time_to_first_token_ms, else first_token_time - first_scheduled_time
@@ -132,7 +152,40 @@ queue_time_ms    queue_time_ms, else first_scheduled_time - arrival_time
 ```
 
 Seconds-valued keys are converted; a key without an `_ms` suffix is read as
-seconds.
+seconds. The second name in each line is a fallback for other engines and for
+vLLM's older timestamp-shaped record, not something 0.29 emits.
+
+### Where the object actually is (vLLM 0.29.0, read from source)
+
+The wire format was an assumption until it was checked, so the checks are
+written down. On a streamed chat completion:
+
+- `metrics` is a **top-level field of the chunk**, not nested under `usage`
+  (`vllm/entrypoints/openai/chat_completion/protocol.py:180`).
+- It rides on the **final usage chunk only** — the one whose `choices` is
+  empty (`chat_completion/serving.py:817-870`). A parser that stops reading at
+  the last content delta never sees it.
+- That final chunk exists only when usage reporting is on, so the runner always
+  sends `stream_options.include_usage: true`. Without it there is no usage
+  chunk and therefore no metrics.
+- The object is suppressed entirely when the request asks for more than one
+  completion (`serving.py:841-842`). The runner never sets `n`.
+- Its fields are `PerRequestMetrics`
+  (`vllm/entrypoints/generate/base/protocol.py:55-62`):
+  `time_to_first_token_ms`, `generation_time_ms`, `queue_time_ms`,
+  `mean_itl_ms`, `tokens_per_second`, `speculative_decoding`. The chunk is
+  serialized with `exclude_none=True`, so a field whose timestamps were
+  unavailable is absent rather than null.
+- `time_to_first_token_ms` is `(first_token_ts - scheduled_ts) * 1000` and
+  `queue_time_ms` is `(scheduled_ts - queued_ts) * 1000`
+  (`vllm/entrypoints/generate/base/serving.py:78-85`), so the two are disjoint
+  and must never be summed into a "TTFT".
+
+`tests/fixtures/vllm_0290_stream_chunk.json` holds that shape with the same
+citations. It is **derived from source, not captured**, and it says so: replace
+it with a chunk captured off the wire during the E5 GPU run. If the captured
+chunk still parses, the derived shape was right; if it does not, that file was
+the assumption that hid the difference.
 
 Client-side `ttft_ms` is the sum of these plus network. Under concurrency it is
 dominated by queue wait, which is a function of offered load rather than of
@@ -171,6 +224,105 @@ the weaker one is never mistaken for the stronger.
 Counters are read as a window, never as a total: a server reused across arms
 carries the previous arm's mass. Neither counter is materialization —
 materialization is observable only in the connector audit stream.
+
+## Connector Audit Join (M1 / M2 / M7)
+
+### The join key
+
+`run-live-gateway` and `merge-results` take `--connector-audit PATH`, the
+connector's audit JSONL (`audit_path` / `SEMBLEND_VLLM_AUDIT_PATH`,
+`schema_version` 2). The join is by request id and nothing else.
+
+The id is **set, not captured**. For each request the runner derives one from
+`(run_id, arm, item_id, role, stream_position)` and sends it two ways:
+
+```text
+X-Request-Id: sembench-warm-000012-recipient-1f0c7a4d9b2e6503   (header)
+{"request_id": "sembench-warm-000012-recipient-1f0c7a4d9b2e6503", ...}  (body)
+```
+
+The header is what vLLM prefers (`_base_request_id`,
+`vllm/entrypoints/serve/engine/serving.py:117-126`); the body field
+(`ChatCompletionRequest.request_id`,
+`chat_completion/protocol.py:389-396`) covers a front end that strips unknown
+headers. vLLM then builds its own id as `chatcmpl-<sent id>`
+(`chat_completion/serving.py:281-283`), and that is the string the connector
+writes into every audit event.
+
+Capturing `chunk["id"]` instead would not work: it gains a per-prompt suffix
+when one HTTP request carries several prompts, which silently drops rows on an
+equality join. Rows therefore carry the **sent** id (`engine_request_id` on
+`RequestMetrics`), and `sembench.connector_audit` resolves an audited engine id
+back to the header it came from — exact match first, then prefix/suffix
+normalization, and an explicit *ambiguous* verdict rather than a guess when one
+normalized key covers two audited requests.
+
+Roles keep donors and recipients apart (`recipient`, `donor-0`, `donor-1`, …),
+so a capture event is attributable to the request that seeded it. The arm and
+the stream position are in the id's readable head; the digest tail covers the
+run id and item id as well, so the two arms of a paired run and two runs
+appending to one audit file cannot collide. Because nothing is random, the same
+manifest replayed under the same `--run-id` re-derives the same ids.
+
+A `--connector-audit` path that does not exist is refused before the arm issues
+any traffic: a misspelled path and an arm that materialized nothing are
+otherwise the same null.
+
+### What the join produces
+
+```text
+connector_audit_present            was any audit joined at all
+connector_audit_rows_joined        rows the audit had something to say about
+
+boundary_alignment_rate            M1  + _numerator / _denominator
+materialized_reuse_rate            M2  + _numerator / _denominator
+materialized_reuse_token_rate      M2, token-weighted (Σ materialized / Σ advertised)
+materialized_reuse_tokens
+materialized_reuse_advertised_tokens
+propagation_contamination_rate     M7  + _numerator / _denominator
+```
+
+- **M1 `boundary_alignment_rate`** — among rows whose manifest says a
+  compatible donor existed (`expected_supplied_tokens > 0`), the fraction whose
+  audited boundary equals `expected_span_target_start`. A row that produced
+  only `semantic_span_boundary_missed` stays in the denominator: the miss is
+  the thing being measured.
+- **M2 `materialized_reuse_rate`** — among rows carrying a
+  `semantic_span_load_advertised`, the fraction that also carried a
+  `runtime_materialized`. `materialized_reuse_token_rate` is the execution
+  plan's token-weighted form of the same metric. They answer different
+  questions — how many requests were served versus how much of the promised
+  mass arrived — and neither substitutes for the other. An advertise is a
+  promise and an allocation is a destination; only `runtime_materialized` is
+  evidence that KV was written.
+- **M7 `propagation_contamination_rate`** (the plan calls M7 "contamination /
+  propagation rate") — among `propagation_probe` rows, the fraction that
+  materialized nothing of their own yet still reported cached tokens: KV that
+  reached them through the exact prefix cache, which is where a previously
+  approximate request's blocks leak to.
+
+Every rate is published beside its own numerator and denominator, so `0.0` over
+three requests is never read as `0.0` over three hundred. Every audit-derived
+key is `null` when no audit was joined — not `0.0`. A run that never looked
+must not publish a clean score, and `config.connector_audit_join` records rows
+matched exactly, matched after normalization, unmatched, ambiguous, and without
+an id at all, so a shrunken denominator is never silent.
+
+## Latency
+
+```text
+ttft_ms      client-side, at the streamed first token (unchanged)
+latency_ms   SERVICE latency: the server time this item cost, summed over its
+             donor requests and its recipient request
+```
+
+`latency_ms` changed in round 2 and the change applies at **every**
+concurrency, the serial path included. It is no longer the item's wall span.
+A wall span also contains the dispatcher's own waits — the donor→recipient gap
+and the post-donor settle — which are delays the harness imposed, not latency
+the engine produced; leaving them in made an arm look slower in proportion to
+how carefully it was isolated. Numbers from before that change are wall spans
+and are not comparable with numbers after it.
 
 ## Throughput Document
 

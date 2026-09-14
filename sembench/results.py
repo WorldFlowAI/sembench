@@ -137,6 +137,7 @@ def aggregate_metrics(requests: list[RequestMetrics]) -> dict[str, Any]:
             if quality_values
             else None
         ),
+        **connector_audit_metrics(requests),
     }
 
 
@@ -178,10 +179,18 @@ def semantic_reuse_tokens(row: RequestMetrics) -> int | None:
     None means no semantic signal was recorded at all — a pre-B12 row, where
     the engine was never asked for the split. None is not zero, and callers
     must not collapse it into one.
+
+    A row the connector audit *did* join and that carries no
+    ``runtime_materialized`` is the one case where an absent external count is
+    a measurement: the audit looked and nothing was materialized. Those rows
+    return 0 (a confirmed miss) rather than None, so they cannot fall through
+    to the cached_tokens-based legacy hit.
     """
     external = row.external_confirmed_tokens
     fuzzy = row.fuzzy_confirmed_tokens or 0
     if external is None:
+        if row.audit_materialized is False:
+            return fuzzy
         return fuzzy or None
     return max(int(external), fuzzy)
 
@@ -219,6 +228,127 @@ def reuse_mechanism(row: RequestMetrics) -> str:
     if prefix_path >= REUSE_HIT_THRESHOLD_TOKENS:
         return "exact"
     return "none"
+
+
+# The traffic class whose whole job is to detect propagation: a verbatim
+# repeat of a request that was previously served approximate KV.
+PROPAGATION_PROBE_CLASS = "propagation_probe"
+
+
+def traffic_class_of(row: RequestMetrics) -> str:
+    """The row's traffic class, falling back to ``transform``.
+
+    Manifests written before the class field existed carry the class in
+    ``transform``; reading both means a probe item is found either way, and an
+    empty string means the row declares no class at all.
+    """
+    return row.traffic_class or row.transform or ""
+
+
+def audit_was_joined(rows: list[RequestMetrics]) -> bool:
+    """Did a connector audit get joined onto any of these rows?
+
+    ``audit_joined`` is None until :func:`sembench.connector_audit.join_requests`
+    touches a row, so this separates "the audit was read and said nothing about
+    these requests" (False on the rows, True here) from "no audit exists"
+    (None on the rows, False here). Every audit-derived rate below is null in
+    the second case: without the audit, every row's
+    ``external_confirmed_tokens`` is null for want of measurement, and a rate
+    computed over that reads as a perfect score for a run that measured
+    nothing.
+    """
+    return any(row.audit_joined is not None for row in rows)
+
+
+def _rate_or_none(numerator: int, denominator: int) -> float | None:
+    """A rate, or None when the denominator is empty — never 0/0 as 0.0."""
+    if denominator <= 0:
+        return None
+    return float(numerator) / float(denominator)
+
+
+def connector_audit_metrics(rows: list[RequestMetrics]) -> dict[str, Any]:
+    """M1 boundary alignment, M2 materialized reuse, M7 propagation.
+
+    All three are joined per request from the connector's audit stream (B10),
+    and all three publish their numerator and denominator beside the rate so a
+    0.0 over three requests is never read as a 0.0 over three hundred.
+
+    M1 ``boundary_alignment_rate`` — among rows whose manifest says a
+    compatible donor existed (``expected_supplied_tokens > 0``), the fraction
+    whose observed boundary equals ``expected_span_target_start``. A row that
+    only ever produced a boundary-missed event stays in the denominator: the
+    miss is the thing being measured.
+
+    M2 ``materialized_reuse_rate`` — among rows carrying a
+    ``semantic_span_load_advertised``, the fraction that also carried a
+    ``runtime_materialized``. The token-weighted form beside it is §4's
+    ``Σ runtime_materialized.tokens / Σ advertised token_count``; they answer
+    different questions (how many requests were served vs how much of the
+    promised mass arrived) and neither substitutes for the other.
+
+    M7 ``propagation_contamination_rate`` — among ``propagation_probe`` rows,
+    the fraction with no materialization of their own
+    (``external_confirmed_tokens`` null) but non-zero ``cached_tokens``: KV
+    that reached them from the exact prefix cache, which is where a previously
+    approximate request's blocks leak to.
+
+    Denominators that only the audit can supply are null, not zero, when no
+    audit was joined; denominators the manifest supplies are reported either
+    way.
+    """
+    joined = audit_was_joined(rows)
+
+    donor_expected = [row for row in rows if (row.expected_supplied_tokens or 0) > 0]
+    aligned = sum(
+        1
+        for row in donor_expected
+        if row.audit_observed_boundary is not None
+        and row.expected_span_target_start is not None
+        and row.audit_observed_boundary == row.expected_span_target_start
+    )
+
+    advertised = [row for row in rows if row.audit_advertised_tokens is not None]
+    materialized_rows = [row for row in advertised if row.audit_materialized]
+    advertised_tokens = sum(row.audit_advertised_tokens or 0 for row in advertised)
+    materialized_tokens = sum(row.external_confirmed_tokens or 0 for row in materialized_rows)
+
+    probes = [row for row in rows if traffic_class_of(row) == PROPAGATION_PROBE_CLASS]
+    propagated = sum(
+        1
+        for row in probes
+        if row.external_confirmed_tokens is None and (row.backend_confirmed_tokens or 0) > 0
+    )
+
+    return {
+        "connector_audit_present": joined,
+        "connector_audit_rows_joined": (
+            sum(1 for row in rows if row.audit_joined) if joined else None
+        ),
+        # M1
+        "boundary_alignment_rate": (
+            _rate_or_none(aligned, len(donor_expected)) if joined else None
+        ),
+        "boundary_alignment_numerator": aligned if joined else None,
+        "boundary_alignment_denominator": len(donor_expected),
+        # M2
+        "materialized_reuse_rate": (
+            _rate_or_none(len(materialized_rows), len(advertised)) if joined else None
+        ),
+        "materialized_reuse_numerator": len(materialized_rows) if joined else None,
+        "materialized_reuse_denominator": len(advertised) if joined else None,
+        "materialized_reuse_token_rate": (
+            _rate_or_none(materialized_tokens, advertised_tokens) if joined else None
+        ),
+        "materialized_reuse_tokens": materialized_tokens if joined else None,
+        "materialized_reuse_advertised_tokens": advertised_tokens if joined else None,
+        # M7
+        "propagation_contamination_rate": (
+            _rate_or_none(propagated, len(probes)) if joined else None
+        ),
+        "propagation_contamination_numerator": propagated if joined else None,
+        "propagation_contamination_denominator": len(probes),
+    }
 
 
 def external_token_sources(rows: list[RequestMetrics]) -> list[str]:
@@ -485,12 +615,21 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
         "hit_only_ttft_speedup_mean": hit_ci.point if hit_ci else None,
         "hit_only_ttft_speedup_ci": hit_ci.to_dict() if hit_ci else None,
         "negative_control_pairs": len(negative_speedups),
+        # The gated statistic for the control, matching the headline: one
+        # control pair that happened to hit a slow cold prefill moves a mean
+        # far enough to fail (or pass) a deviation gate on its own.
         "negative_control_ttft_speedup_median": (
             negative_median_ci.point if negative_median_ci else None
+        ),
+        "negative_control_ttft_speedup_median_ci": (
+            negative_median_ci.to_dict() if negative_median_ci else None
         ),
         "negative_control_ttft_speedup_mean": negative_ci.point if negative_ci else None,
         "warm_vs_cold_output_rouge_l_mean": rouge_ci.point if rouge_ci else None,
         "warm_vs_cold_output_rouge_l_ci": rouge_ci.to_dict() if rouge_ci else None,
+        # Audit-joined metrics are the warm (connector) arm's: the cold arm
+        # runs without a connector and has no audit stream to join.
+        **connector_audit_metrics(warm_rows),
         **_kl_summary(pairs),
         **_engine_ttft_summary(pairs),
         # Back-compat alias for the pre-P3 field name.

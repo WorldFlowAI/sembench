@@ -7,6 +7,7 @@ These tests pin the pairing being deterministic per item and per arm.
 """
 
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -14,7 +15,12 @@ from sembench import gateway_live
 from sembench.gateway_live import LiveGatewayConfig, cold_arm_contaminated, run_live_gateway
 from sembench.pairing import COLD_ARM, WARM_ARM, replay_plan
 from sembench.results import paired_summary
-from sembench.schema import DonorPrompt, WorkloadItem, write_jsonl
+from sembench.schema import (
+    EXTERNAL_SOURCE_CONNECTOR_AUDIT,
+    DonorPrompt,
+    WorkloadItem,
+    write_jsonl,
+)
 
 
 def _item(item_id: str, *, donors: int = 1, negative: bool = False) -> WorkloadItem:
@@ -31,6 +37,25 @@ def _item(item_id: str, *, donors: int = 1, negative: bool = False) -> WorkloadI
         answers=["42 minutes"],
         negative_control=negative,
     )
+
+
+def _with_external_split(rows):
+    """Stamp the warm rows with the external split the audit join supplies.
+
+    The fake gateway reports `cached_tokens`, which on a prefix-caching-on
+    vLLM arm is local cache + external transfer; the warm twin's hit has to
+    be judged on the connector-confirmed external mass alone.
+    """
+    return [
+        replace(
+            row,
+            external_confirmed_tokens=96,
+            external_confirmed_tokens_source=EXTERNAL_SOURCE_CONNECTOR_AUDIT,
+        )
+        if row.arm == WARM_ARM
+        else row
+        for row in rows
+    ]
 
 
 def _manifest(tmp_path, items) -> str:
@@ -155,12 +180,14 @@ def test_gateway_paired_result_has_a_real_paired_summary(tmp_path, fake_gateway)
     rows = run_live_gateway(
         _config(tmp_path, [_item("i1"), _item("i2")], paired=True, reset_urls=("http://w/reset",))
     )
-    summary = paired_summary(rows)
+    summary = paired_summary(_with_external_split(rows))
 
     assert summary is not None
     assert summary["pairs_used"] == 2
     assert summary["blended_ttft_speedup_mean"] == 200.0 / 40.0
     assert summary["hit_rate"] == 1.0
+    assert summary["hit_rate_external_confirmed"] == 1.0
+    assert summary["pairs_external_unconfirmed"] == 0
     assert summary["ttft_cold_p50_ms"] == 200.0
     assert summary["ttft_warm_p50_ms"] == 40.0
 
