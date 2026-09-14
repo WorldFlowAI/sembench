@@ -15,6 +15,7 @@ from pathlib import Path
 import pytest
 
 from sembench.connector_audit import (
+    MATCH_NORMALIZED,
     AuditError,
     join_audit_file,
     join_requests,
@@ -386,6 +387,51 @@ def test_normalized_ids_strip_one_prefix_and_one_subrequest_suffix():
     ends in a number still matches and a collision is still visible."""
     assert normalized_ids("cmpl-sb-r1-i7-0") == ("cmpl-sb-r1-i7", "sb-r1-i7", "sb-r1-i7-0")
     assert normalized_ids("chatcmpl-sb-r1-i7") == ("sb-r1-i7",)
+
+
+def test_normalized_ids_strip_the_engines_random_suffix():
+    """vLLM 0.29 schedules ``<id>-<8 hex>`` (InputProcessor.assign_request_id)
+    while the HTTP response echoes the unsuffixed id. These are the exact ids
+    the phase-0 E5 run produced on 2026-09-14; before this the join matched
+    0 of 24 rows against an audit that held every one of them."""
+    audited = "chatcmpl-sembench-single-000004-recipient-dcbf41f096774a65-bd284b45"
+    sent = "sembench-single-000004-recipient-dcbf41f096774a65"
+    assert sent in normalized_ids(audited)
+    # completions: handler suffix under the random one
+    assert "sb-r1-i7" in normalized_ids("cmpl-sb-r1-i7-0-9ffb51a0")
+    # a client id that merely ends in eight hex characters keeps its own form too
+    assert "job-deadbeef" in normalized_ids("chatcmpl-job-deadbeef")
+    assert "job" in normalized_ids("chatcmpl-job-deadbeef")
+
+
+def test_join_matches_rows_against_randomized_engine_ids(tmp_path):
+    """End to end: an audit written under the randomized ids joins to rows
+    that sent the plain ids, uniquely, as MATCH_NORMALIZED."""
+    sent = [f"sembench-single-{i:06d}-recipient-{i:016x}" for i in range(3)]
+    audit = tmp_path / "audit.jsonl"
+    lines = []
+    for seq, plain in enumerate(sent, start=1):
+        engine_id = f"chatcmpl-{plain}-{seq:08x}"
+        lines.append(
+            json.dumps(
+                {
+                    "schema_version": 2,
+                    "event": "request_first_seen",
+                    "source": "scheduler",
+                    "connector_id": "SCHEDULER-1-1",
+                    "request_id": engine_id,
+                    "request_seq": seq,
+                    "event_seq": 0,
+                    "prompt_tokens": 100,
+                }
+            )
+        )
+    audit.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    index = load_audit(audit)
+    for plain in sent:
+        match = index.resolve(plain)
+        assert match.record is not None, plain
+        assert match.kind == MATCH_NORMALIZED
 
 
 def test_two_subrequests_of_one_id_are_refused_not_guessed(tmp_path):

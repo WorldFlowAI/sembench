@@ -20,12 +20,24 @@ tree) — but the id the *engine* then uses is not the header verbatim:
 - chat completions build ``chatcmpl-<header>`` at
   ``vllm/entrypoints/openai/chat_completion/serving.py:281-283`` and keep it
   unsuffixed for one prompt, gaining ``f"{request_id}_{i}"`` only when one
-  HTTP request carries several prompts (``:306-308``).
+  HTTP request carries several prompts (``:306-308``);
+- the engine then REPLACES that id with an internal one carrying eight
+  random characters, ``<id>-<8 hex>``, "in order to ensure uniqueness"
+  (``InputProcessor.assign_request_id``,
+  ``vllm/v1/engine/input_processor.py:262-280``; the original survives only
+  as ``EngineCoreRequest.external_req_id``, which the scheduler-side
+  ``Request`` the connector sees does not carry). The HTTP response still
+  echoes the unsuffixed ``chatcmpl-<header>``. Measured live on 0.29.0
+  (phase-0 E5, 2026-09-14): the connector audited
+  ``chatcmpl-sembench-single-000004-recipient-dcbf41f096774a65-bd284b45``
+  for a row that sent ``sembench-single-000004-recipient-dcbf41f096774a65``.
+  ``VLLM_DISABLE_REQUEST_ID_RANDOMIZATION`` turns it off but is deprecated.
 
 So this module matches the header id against the audited request id exactly
-first, then against the audited id with that prefix and sub-request suffix
-removed — and **refuses** (recording the row as ambiguous) rather than
-guessing when one normalized key covers two audited requests.
+first, then against the audited id with that prefix, the random suffix and
+the sub-request suffix removed (every intermediate form is a candidate) — and
+**refuses** (recording the row as ambiguous) rather than guessing when one
+normalized key covers two audited requests.
 
 Only ``runtime_materialized`` counts as backend-confirmed KV reuse, per the
 connector's own audit contract. An advertise is a promise, an allocation is a
@@ -133,6 +145,9 @@ ENGINE_ID_PREFIXES = ("chatcmpl-", "cmpl-")
 # The per-prompt sub-request suffix: "-0" (completions, always) or "_0" (chat,
 # only for a multi-prompt request).
 _SUBREQUEST_SUFFIX = re.compile(r"[-_]\d+$")
+# vLLM 0.29's InputProcessor.assign_request_id appends "-" + 8 random hex
+# characters to every request id it schedules (see the module docstring).
+_RANDOM_ID_SUFFIX = re.compile(r"-[0-9a-f]{8}$")
 
 MATCH_EXACT = "exact"
 MATCH_NORMALIZED = "normalized"
@@ -688,6 +703,12 @@ def normalized_ids(engine_request_id: str) -> tuple[str, ...]:
     for prefix in ENGINE_ID_PREFIXES:
         if engine_request_id.startswith(prefix):
             bases.add(engine_request_id[len(prefix) :])
+    # The engine's random suffix comes last on the wire, so it is stripped
+    # first; the handler's sub-request suffix sits under it (cmpl-<id>-0-<hex8>).
+    for base in list(bases):
+        without_random = _RANDOM_ID_SUFFIX.sub("", base)
+        if without_random and without_random != base:
+            bases.add(without_random)
     candidates = set(bases)
     for base in bases:
         trimmed = _SUBREQUEST_SUFFIX.sub("", base)
