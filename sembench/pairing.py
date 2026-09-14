@@ -255,11 +255,20 @@ def merged_run_metadata(
     *,
     run_id: str | None = None,
 ) -> RunMetadata:
-    """Run identity for a merged result: warm arm's engine, cold arm as baseline."""
+    """Run identity for a merged result: warm arm's engine, cold arm as baseline.
+
+    ``baseline_id`` is run IDENTITY and falls back to the cold run's id when
+    the cold arm declared no backend/baseline label, so that a merged document
+    always says which run was the baseline. ``baseline_arm_declared`` carries
+    only what an operator actually declared and has no such fallback: a run id
+    is free text ("phase0-g5-a1-rack-cold") that can name an arm by accident,
+    and M7 reads the declaration, never the identity.
+    """
     cold_run = cold_payload.get("run") or {}
     warm_run = warm_payload.get("run") or {}
     cold_id = str(cold_run.get("run_id") or "cold")
     warm_id = str(warm_run.get("run_id") or "warm")
+    declared_baseline = str(cold_run.get("backend_id") or cold_run.get("baseline_id") or "")
     return RunMetadata(
         run_id=run_id or f"{cold_id}+{warm_id}",
         engine=str(warm_run.get("engine") or cold_run.get("engine") or ""),
@@ -269,7 +278,8 @@ def merged_run_metadata(
         arm=MERGED_ARM,
         engine_version=str(warm_run.get("engine_version") or ""),
         backend_id=str(warm_run.get("backend_id") or ""),
-        baseline_id=str(cold_run.get("backend_id") or cold_run.get("baseline_id") or cold_id),
+        baseline_id=declared_baseline or cold_id,
+        baseline_arm_declared=declared_baseline,
         sembench_version=str(warm_run.get("sembench_version") or ""),
         sembench_git_sha=str(warm_run.get("sembench_git_sha") or ""),
         sembench_git_dirty=bool(warm_run.get("sembench_git_dirty") or False),

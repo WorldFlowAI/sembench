@@ -68,11 +68,20 @@ ALIGNMENT_OPPORTUNITY_CLASSES = (SAME_DOC_NEW_INSTRUCTION_CLASS, REVISED_DOC_CLA
 # and what line 128's mechanism is about. (It is NOT a claim that the donor was
 # written with the same wrapper: in M1's opportunity population the donor's
 # wrapper differs by construction, which is exactly why the identity reading
-# was rejected above.) Everything below the head is ad-hoc traffic whose
-# recipient wrapper is usually cold, so the shared token-level tail that
-# alignment is a property of (caveat A of the plan) is a different one. The two
-# strata therefore answer different questions, and a blended rate over them is
+# was rejected above.) Everything below the head is traffic whose recipient
+# wrapper is usually cold, so the shared token-level tail that alignment is a
+# property of (caveat A of the plan) is a different one. The two strata
+# therefore answer different questions, and a blended rate over them is
 # dominated by whichever wrapper happened to be popular.
+#
+# What the plan's name "ad-hoc" does NOT mean here, and the rule says so in
+# every document: Stream B draws all eight of its wrappers from one fixed
+# shared set (`phase0-build-manifest.py`: WRAPPERS), so no item carries a
+# one-off wrapper of its own. Ranks 2-7 are shared wrappers that are merely
+# unpopular — the TAIL of the popularity order — and a number from this stratum
+# is not a measurement of genuinely ad-hoc traffic. The boundary is also not a
+# natural break: the head is a thin 56.1% majority and rank 1 (17.8% of rows)
+# sits about five points above rank 2 (12.9%).
 SHARED_WRAPPER_MAX_RANK = 1
 SHARED_WRAPPER_STRATUM = "shared_wrapper"
 AD_HOC_WRAPPER_STRATUM = "ad_hoc"
@@ -87,7 +96,10 @@ WRAPPER_STRATUM_RULE = (
     "majority of the stream sits on, so the recipient's OWN wrapper is routinely resident "
     "and its boundary is non-zero; not a claim about the donor's wrapper, which differs by "
     "construction); ad_hoc = any lower rank; unstratified = the manifest "
-    "named no wrapper. Each stratum's opportunity denominator is the rows it holds, because "
+    "named no wrapper. ad_hoc is the plan's word, not a claim about the traffic: every "
+    "wrapper in this workload comes from one shared fixed set, so ranks >= 2 are the "
+    "unpopular TAIL of that set and no item carries a genuinely one-off wrapper. "
+    "Each stratum's opportunity denominator is the rows it holds, because "
     "the manifest's class counts are not split by wrapper. The plan defines neither term: "
     "this is the popularity reading, chosen over donor/recipient wrapper identity, which is "
     "degenerate for M1's opportunity population. The constant is pinned, so "

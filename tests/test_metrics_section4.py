@@ -657,12 +657,18 @@ def test_m7_reports_probes_it_could_not_score_instead_of_dropping_them():
     # The parent is not in this arm at all, so there is no served answer.
     assert no_parent["propagation_probes_without_served_answer"] == 1
     # The probe stays in the denominator: a probe that could not be scored is
-    # not evidence of no contamination, so the headline rate divides by the
-    # probe SET and the scored-only rate keeps its own name.
+    # not evidence of no contamination, so the denominator is the probe SET and
+    # never the scored subset.
     assert no_parent["propagation_contamination_denominator"] == 1
-    assert no_parent["propagation_contamination_rate"] == 0.0
-    assert no_parent["propagation_contamination_scored_denominator"] == 0
+    assert no_parent["propagation_contamination_scored_denominator"] is None
     assert no_parent["propagation_contamination_rate_scored_only"] is None
+    # ...and here that set yielded NOTHING, so there is no rate to publish at
+    # all (round 6, fourth pass). 0 propagated out of 0 read is a clean
+    # contamination number manufactured by failing to measure; the exclusion
+    # counter above is the finding, under a flag that says so.
+    assert no_parent["propagation_no_probe_scored"] is True
+    assert no_parent["propagation_contamination_rate"] is None
+    assert no_parent["propagation_contamination_numerator"] is None
     assert no_link["propagation_probes_unlinked"] == 1
 
 

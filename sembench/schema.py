@@ -395,6 +395,14 @@ class RunMetadata:
     engine_version: str = ""
     backend_id: str = ""
     baseline_id: str = ""
+    # Which ARM the baseline declared itself to be, and nothing else. It is
+    # kept apart from ``baseline_id`` because that field is run IDENTITY and
+    # falls back to the cold run's id on a merge (``merged_run_metadata``), and
+    # a run id is not an arm declaration: a run called "phase0-g5-a1-rack-cold"
+    # would otherwise resolve to A1 by substring and unlock M7 against a cold
+    # arm nobody identified. Metrics that turn on "which arm answered as cold"
+    # read this field; readers who want to know which run it was read the other.
+    baseline_arm_declared: str = ""
     sembench_version: str = ""
     sembench_git_sha: str = ""
     sembench_git_dirty: bool = False
@@ -464,6 +472,10 @@ def collect_run_metadata(
         engine_version=engine_version,
         backend_id=backend_id,
         baseline_id=baseline_id,
+        # An operator wrote --baseline-id as a label for the baseline arm, so
+        # on a single-arm run it IS the declaration. Only the merge's run-id
+        # fallback is not, and that one never reaches here.
+        baseline_arm_declared=baseline_id,
         sembench_version=_package_version("sembench"),
         sembench_git_sha=sha,
         sembench_git_dirty=dirty,

@@ -7,6 +7,12 @@ import json
 import subprocess
 from pathlib import Path
 
+from sembench.cli_audit import (
+    add_connector_audit_arg,
+    connector_audit_or_exit,
+    join_connector_audit,
+    request_id_echo,
+)
 from sembench.engine_config import (
     attach_engine_document,
     engine_document,
@@ -16,22 +22,29 @@ from sembench.engine_config import (
     snapshots_from_document,
 )
 from sembench.engine_events import parse_engine_events
+from sembench.gates_cli import add_gates_parser, cmd_assert_result_gates
 from sembench.gateway_live import (
     LiveGatewayConfig,
     parse_worker_urls,
     run_live_gateway_measured,
 )
-from sembench.longbench import DEFAULT_LONGBENCH_V1_DATASETS, load_source_records
+from sembench.manifest_cli import (
+    add_manifest_parsers,
+    cmd_audit_manifest,
+    cmd_build,
+    cmd_checksum_manifest,
+    cmd_freeze,
+    cmd_verify_frozen,
+)
+from sembench.merge import add_merge_parser, cmd_merge_results
 from sembench.offline import OfflineConfig, run_offline
 from sembench.prometheus import MetricsWindow, scrape_all
-from sembench.results import PHASE0_ARM_PAIRS, PROPAGATION_COLD_REFERENCE_ARM, write_result
-from sembench.schema import write_jsonl
+from sembench.results import write_result
 from sembench.sglang_live import (
     LiveSglangConfig,
     manifest_class_counts_for,
     run_live_sglang_sync,
 )
-from sembench.transforms import DEFAULT_TRANSFORMS, TransformConfig, build_workload
 
 
 def main(argv: list[str] | None = None) -> None:
@@ -162,74 +175,6 @@ def _engine_metrics_urls(args) -> list[str]:
     )
 
 
-def _add_connector_audit_arg(parser: argparse.ArgumentParser) -> None:
-    """The connector audit JSONL this result is to be joined against.
-
-    The audit is the only artifact that can say a load was *materialized*
-    rather than advertised, so M1/M2/M7 are unobtainable without it.
-    """
-    parser.add_argument(
-        "--connector-audit",
-        default=None,
-        metavar="PATH",
-        help="SemBlend vLLM connector audit JSONL (the connector's audit_path) to join this "
-        "result against by request_id; source of alignment_given_match / "
-        "alignment_given_opportunity / boundary_miss_breakdown (M1), materialized_reuse_rate "
-        "(M2, token-weighted) and prefix_blocks_evicted (M7's gating counter)",
-    )
-
-
-def _connector_audit_or_exit(args) -> str | None:
-    """The audit path, checked to exist before an arm spends any GPU time.
-
-    A mistyped path is otherwise indistinguishable downstream from an arm that
-    genuinely produced no materialization events, and that confusion reads as
-    a clean zero rather than as a missing measurement.
-    """
-    path = getattr(args, "connector_audit", None)
-    if not path:
-        return None
-    if not Path(path).is_file():
-        raise SystemExit(
-            f"connector audit: {path} does not exist. Point --connector-audit at the file the "
-            "connector's audit_path / SEMBLEND_VLLM_AUDIT_PATH writes, or drop the flag; a "
-            "missing audit is not an arm with no materialization"
-        )
-    return str(path)
-
-
-def _join_connector_audit(requests: list, connector_audit: str | None) -> tuple[list, dict | None]:
-    """Stamp the audit's facts onto the rows before the result is written.
-
-    Returns the rows and the join report. With no audit the rows pass through
-    untouched and every audit-derived metric stays null, which is the honest
-    reading of a run that measured nothing rather than a zero.
-    """
-    if not connector_audit:
-        return list(requests), None
-    from sembench.connector_audit import AuditError, join_audit_file
-
-    try:
-        joined, report = join_audit_file(requests, connector_audit)
-    except AuditError as exc:
-        raise SystemExit(f"connector audit: {exc}") from exc
-    return list(joined), report.to_dict()
-
-
-def _request_id_echo(requests: list) -> dict:
-    """Did the engine adopt the ids the runner sent?
-
-    Reported whether or not an audit was joined: a front end that strips
-    ``X-Request-Id`` makes vLLM mint its own id, and every audit-derived
-    metric then reads as an arm that materialized nothing. The mismatch count
-    is the difference between "no reuse happened" and "the join key never
-    arrived".
-    """
-    from sembench.connector_audit import request_id_echo_report
-
-    return request_id_echo_report(requests)
-
-
 def _engine_flags_or_exit(args):
     try:
         return load_engine_flags(
@@ -241,24 +186,6 @@ def _engine_flags_or_exit(args):
         raise SystemExit(f"engine config: {exc}") from exc
 
 
-class _GateThreshold(argparse.Action):
-    """A gate threshold, remembering that the caller actually asked for it.
-
-    Gates whose metric is absent used to be skipped, which reads as a pass in
-    CI: that is how a reuse gate goes green on a run that never measured
-    reuse. A gate the caller explicitly requested now fails when its metric is
-    missing, so `requested_gates` has to survive parsing.
-    """
-
-    def __call__(self, parser, namespace, values, option_string=None) -> None:
-        setattr(namespace, self.dest, values)
-        requested = getattr(namespace, "requested_gates", None)
-        if requested is None:
-            requested = set()
-            setattr(namespace, "requested_gates", requested)
-        requested.add(self.dest)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="sembench",
@@ -266,23 +193,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     sub = parser.add_subparsers(dest="command")
 
-    build = sub.add_parser("build", help="Build a local workload manifest")
-    build.add_argument(
-        "--profile",
-        choices=("fixture", "synthetic-v1", "longbench-v1", "longbench-v2"),
-        default=None,
-    )
-    build.add_argument("--frozen", default=None, help="Build from a frozen spec (e.g. v1)")
-    build.add_argument("--hf-revision", default=None, help="Pin the HF dataset revision")
-    build.add_argument("--output", required=True)
-    build.add_argument("--datasets", nargs="*", default=None)
-    build.add_argument("--max-items-per-dataset", type=int, default=None)
-    build.add_argument("--transforms", nargs="*", default=list(DEFAULT_TRANSFORMS))
-    build.add_argument("--max-segments", type=int, default=4)
-    build.add_argument("--min-segment-chars", type=int, default=400)
-
-    checksum = sub.add_parser("checksum-manifest", help="Print the SHA256 of a manifest file")
-    checksum.add_argument("--manifest", required=True)
+    add_manifest_parsers(sub)
 
     verify = sub.add_parser(
         "verify-endpoint", help="Pre-flight check a live endpoint (reachability, model identity)"
@@ -290,18 +201,6 @@ def build_parser() -> argparse.ArgumentParser:
     verify.add_argument("--engine", choices=("sglang", "gateway"), required=True)
     verify.add_argument("--base-url", required=True)
     verify.add_argument("--expect-model", default=None)
-
-    audit = sub.add_parser(
-        "audit-manifest", help="Check a manifest for phantom cross-item block collisions"
-    )
-    audit.add_argument("--manifest", required=True)
-    audit.add_argument("--block-size", type=int, default=16)
-    audit.add_argument("--tokenizer", default=None)
-
-    freeze = sub.add_parser("freeze", help="Build a frozen spec's manifest and record its checksum")
-    freeze.add_argument("--spec", required=True)
-    freeze.add_argument("--manifests-dir", default="manifests")
-    freeze.add_argument("--block-size", type=int, default=16)
 
     calibrate = sub.add_parser(
         "calibrate-noise-floor",
@@ -317,12 +216,6 @@ def build_parser() -> argparse.ArgumentParser:
     calibrate.add_argument("--warmup-requests", type=int, default=2)
     calibrate.add_argument("--timeout-seconds", type=int, default=3600)
     calibrate.add_argument("--skip-verify", action="store_true")
-
-    verify_frozen = sub.add_parser(
-        "verify-frozen", help="Rebuild a frozen spec and compare against recorded checksums"
-    )
-    verify_frozen.add_argument("--spec", required=True)
-    verify_frozen.add_argument("--manifests-dir", default="manifests")
 
     offline = sub.add_parser("run-offline", help="Run offline exact-vs-SemBlend metrics")
     _add_run_identity_args(offline)
@@ -437,55 +330,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="Engine cache-reset endpoint POSTed before each arm; repeat per worker "
         "(vLLM: http://host:8000/reset_prefix_cache?reset_external=true)",
     )
-    _add_connector_audit_arg(gateway)
-
-    merge = sub.add_parser(
-        "merge-results",
-        help="Join a cold and a warm single-arm result into one paired result by item_id",
-    )
-    merge.add_argument("--cold", required=True, help="Result JSON for the cold (baseline) arm")
-    merge.add_argument("--warm", required=True, help="Result JSON for the warm (treatment) arm")
-    merge.add_argument("--output", required=True)
-    merge.add_argument("--run-id", default=None)
-    merge.add_argument(
-        "--allow-unpaired",
-        action="store_true",
-        help="Merge anyway when the arms do not join one-to-one (the pairing report still "
-        "records every unpaired row; the paired summary is then a subset, not the run)",
-    )
-    merge.add_argument(
-        "--pair",
-        default=None,
-        choices=sorted(PHASE0_ARM_PAIRS),
-        help="Which of the phase-0 plan's section-4 comparisons this merge is "
-        "(m3_ttft = A1 vs A4, m6_noise_floor = A1 vs A2, m4_capture = A3 vs A4, "
-        "m4_instrumentation = A5 vs A4, m7_propagation = A4 vs A6). Recorded on the "
-        "merged document and checked against each arm's --backend-id/--baseline-id, so "
-        "an A3-vs-A5 merge cannot be published as the M3 headline",
-    )
-    merge.add_argument(
-        "--cold-reference",
-        default=None,
-        metavar="RESULT",
-        help="Result JSON for the A1 reference arm, used as M7's cold answer. Section 4 "
-        "compares the treatment answer against the COLD (A1) output, and on an "
-        "m7_propagation merge the baseline arm is A4 — which can be contaminated on the "
-        "same probe. propagation_contamination_rate is published only when some run is "
-        "identified as A1: this flag, --pair m3_ttft/m6_noise_floor, or a cold arm whose "
-        "--backend-id names A1. A merge that identifies no arm (the default, since "
-        "--backend-id defaults to empty) publishes null with "
-        "propagation_cold_reference_missing true and _arm 'undeclared'",
-    )
-    merge.add_argument(
-        "--cold-reference-arm",
-        default=PROPAGATION_COLD_REFERENCE_ARM,
-        help="Which arm --cold-reference holds. Checked against that result's own "
-        "--backend-id and refused on a contradiction; the merged document records the "
-        "arm the reference DECLARES, and a reference that declares none is recorded as "
-        f"undeclared rather than as an asserted {PROPAGATION_COLD_REFERENCE_ARM} "
-        f"(default {PROPAGATION_COLD_REFERENCE_ARM})",
-    )
-    _add_connector_audit_arg(merge)
+    add_connector_audit_arg(gateway)
 
     load = sub.add_parser(
         "run-load",
@@ -551,264 +396,10 @@ def build_parser() -> argparse.ArgumentParser:
     collect.add_argument("--output-log", required=True)
     collect.add_argument("--output-summary", required=True)
 
-    gates = sub.add_parser(
-        "assert-result-gates",
-        help="Fail unless replay and engine audit artifacts meet quality/reuse gates",
-    )
-    gates.add_argument("--result", required=True)
-    gates.add_argument("--engine-summary", action="append", default=[])
-    gates.add_argument("--min-quality-pass-rate", type=float, default=0.0, action=_GateThreshold)
-    gates.add_argument(
-        "--min-semantic-placement-rate", type=float, default=0.0, action=_GateThreshold
-    )
-    gates.add_argument(
-        "--min-backend-confirmed-block-rate", type=float, default=0.0, action=_GateThreshold
-    )
-    gates.add_argument("--min-materialization-events", type=int, default=0)
-    gates.add_argument("--min-materialized-tokens", type=int, default=0)
-    gates.add_argument("--min-materialized-units", type=int, default=0)
-    gates.add_argument(
-        "--max-negative-control-confirmed-rate", type=float, default=0.0, action=_GateThreshold
-    )
-    gates.add_argument(
-        "--max-negative-control-semantic-placement-rate",
-        type=float,
-        default=1.0,
-        action=_GateThreshold,
-    )
-    gates.add_argument("--require-materialized-reuse", action="store_true")
-    gates.add_argument("--require-no-engine-errors", action="store_true")
-    gates.add_argument(
-        "--min-blended-ttft-speedup", type=float, default=None, action=_GateThreshold
-    )
-    gates.add_argument(
-        "--max-negative-control-speedup-deviation",
-        type=float,
-        default=None,
-        action=_GateThreshold,
-        help="Max allowed |negative-control speedup - 1.0| (cache must not fire on unrelated content)",
-    )
-    gates.add_argument(
-        "--allow-missing",
-        action="store_true",
-        help="Skip an explicitly requested gate whose metric is absent instead of failing "
-        "(a skipped gate reads as a pass: say so on purpose)",
-    )
-    gates.add_argument(
-        "--require-contamination-check",
-        action="store_true",
-        help="Fail if any paired cold arm was flush-contaminated",
-    )
-    gates.add_argument(
-        "--noise-floor-calibration",
-        default=None,
-        help="Calibration artifact from calibrate-noise-floor",
-    )
-    gates.add_argument(
-        "--max-warm-vs-cold-rouge-drop",
-        type=float,
-        default=None,
-        action=_GateThreshold,
-        help="Max allowed drop of paired warm-vs-cold ROUGE-L below the calibrated floor (requires --noise-floor-calibration)",
-    )
+    add_merge_parser(sub)
+    add_gates_parser(sub)
 
     return parser
-
-
-def _build_items(
-    *,
-    profile: str,
-    datasets: list[str] | None,
-    max_items_per_dataset: int | None,
-    transforms: tuple[str, ...],
-    max_segments: int,
-    min_segment_chars: int,
-    revision: str | None,
-    negative_selection: str = "cross_domain",
-):
-    if profile == "longbench-v1" and not datasets:
-        datasets = list(DEFAULT_LONGBENCH_V1_DATASETS)
-    real_data = profile.startswith("longbench")
-    fetch_cap = max_items_per_dataset
-    if real_data and fetch_cap is not None:
-        # Over-fetch so dropping duplicated documents doesn't shrink the corpus.
-        fetch_cap = fetch_cap * 2
-    records = load_source_records(
-        profile=profile,
-        datasets=datasets,
-        max_items_per_dataset=fetch_cap,
-        revision=revision,
-    )
-    if real_data:
-        from sembench.dedupe import drop_overlapping_sources, trim_per_dataset
-
-        records, dedupe_report = drop_overlapping_sources(records)
-        records = trim_per_dataset(records, max_items_per_dataset)
-        if dedupe_report.dropped:
-            print(json.dumps({"dedupe_dropped": dedupe_report.dropped}, indent=2, sort_keys=True))
-    config = TransformConfig(
-        transforms=transforms,
-        max_segments=max_segments,
-        min_segment_chars=min_segment_chars,
-        negative_selection=negative_selection,
-    )
-    return records, build_workload(records, config)
-
-
-def cmd_build(args) -> None:
-    if args.frozen is not None:
-        from sembench.frozen import get_frozen_spec
-
-        overridden = [
-            flag
-            for flag, given in (
-                ("--profile", args.profile is not None),
-                ("--datasets", bool(args.datasets)),
-                ("--hf-revision", args.hf_revision is not None),
-            )
-            if given
-        ]
-        if overridden:
-            raise SystemExit(
-                f"--frozen pins these inputs; drop {', '.join(overridden)} "
-                "(a frozen build must not be overridable)"
-            )
-        spec = get_frozen_spec(args.frozen)
-        profile = spec.profile
-        datasets = list(spec.datasets)
-        max_items_per_dataset = spec.max_items_per_dataset
-        transforms = spec.transforms
-        max_segments = spec.max_segments
-        min_segment_chars = spec.min_segment_chars
-        revision = spec.hf_revision
-        negative_selection = spec.negative_selection
-    else:
-        if args.profile is None:
-            raise SystemExit("one of --profile or --frozen is required")
-        profile = args.profile
-        datasets = args.datasets
-        max_items_per_dataset = args.max_items_per_dataset
-        transforms = tuple(args.transforms)
-        max_segments = args.max_segments
-        min_segment_chars = args.min_segment_chars
-        revision = args.hf_revision
-        negative_selection = "cross_domain"
-
-    records, items = _build_items(
-        profile=profile,
-        datasets=datasets,
-        max_items_per_dataset=max_items_per_dataset,
-        transforms=transforms,
-        max_segments=max_segments,
-        min_segment_chars=min_segment_chars,
-        revision=revision,
-        negative_selection=negative_selection,
-    )
-    write_jsonl(args.output, items)
-
-    summary = {
-        "output": str(Path(args.output)),
-        "profile": profile,
-        "frozen": args.frozen,
-        "source_records": len(records),
-        "workload_items": len(items),
-        "datasets": sorted({item.dataset for item in items}),
-        "transforms": sorted({item.transform for item in items}),
-    }
-    print(json.dumps(summary, indent=2, sort_keys=True))
-
-
-def _build_frozen_manifest(spec, output_path: Path) -> int:
-    _, items = _build_items(
-        profile=spec.profile,
-        datasets=list(spec.datasets),
-        max_items_per_dataset=spec.max_items_per_dataset,
-        transforms=spec.transforms,
-        max_segments=spec.max_segments,
-        min_segment_chars=spec.min_segment_chars,
-        revision=spec.hf_revision,
-        negative_selection=spec.negative_selection,
-    )
-    write_jsonl(output_path, items)
-    return len(items)
-
-
-def cmd_audit_manifest(args) -> None:
-    from sembench.collision_audit import audit_manifest_items
-    from sembench.schema import read_jsonl
-
-    report = audit_manifest_items(
-        read_jsonl(args.manifest),
-        block_size=args.block_size,
-        tokenizer_name=args.tokenizer,
-    )
-    print(json.dumps(report.to_dict(), indent=2, sort_keys=True))
-    if not report.passed:
-        raise SystemExit(1)
-
-
-def cmd_freeze(args) -> None:
-    from sembench.collision_audit import audit_manifest_items
-    from sembench.frozen import get_frozen_spec, write_checksums
-    from sembench.schema import manifest_sha256, read_jsonl
-
-    spec = get_frozen_spec(args.spec)
-    manifest_path = Path(args.manifests_dir) / spec.manifest_filename()
-    item_count = _build_frozen_manifest(spec, manifest_path)
-    audit = audit_manifest_items(read_jsonl(manifest_path), block_size=args.block_size)
-    if not audit.passed:
-        print(json.dumps(audit.to_dict(), indent=2, sort_keys=True))
-        raise SystemExit(
-            f"collision audit failed: {len(audit.violations)} violations — not freezing"
-        )
-    digest = manifest_sha256(manifest_path)
-    checksums = write_checksums(
-        args.manifests_dir, spec, manifest_sha256=digest, workload_items=item_count
-    )
-    print(
-        json.dumps(
-            {
-                "spec": spec.name,
-                "manifest": str(manifest_path),
-                "sha256": digest,
-                "workload_items": item_count,
-                "checksums": str(checksums),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
-
-
-def cmd_verify_frozen(args) -> None:
-    import tempfile
-
-    from sembench.frozen import get_frozen_spec, read_checksums
-    from sembench.schema import manifest_sha256
-
-    spec = get_frozen_spec(args.spec)
-    recorded = read_checksums(args.manifests_dir, spec)
-    with tempfile.TemporaryDirectory() as tmp:
-        rebuilt = Path(tmp) / spec.manifest_filename()
-        item_count = _build_frozen_manifest(spec, rebuilt)
-        digest = manifest_sha256(rebuilt)
-    passed = digest == recorded["sha256"] and item_count == recorded["workload_items"]
-    print(
-        json.dumps(
-            {
-                "spec": spec.name,
-                "recorded_sha256": recorded["sha256"],
-                "rebuilt_sha256": digest,
-                "recorded_items": recorded["workload_items"],
-                "rebuilt_items": item_count,
-                "passed": passed,
-            },
-            indent=2,
-            sort_keys=True,
-        )
-    )
-    if not passed:
-        raise SystemExit(1)
 
 
 def cmd_run_offline(args) -> None:
@@ -881,18 +472,6 @@ def cmd_verify_endpoint(args) -> None:
         raise SystemExit(3)
 
 
-def cmd_checksum_manifest(args) -> None:
-    from sembench.schema import manifest_sha256
-
-    print(
-        json.dumps(
-            {"manifest": args.manifest, "sha256": manifest_sha256(args.manifest)},
-            indent=2,
-            sort_keys=True,
-        )
-    )
-
-
 def cmd_run_live_sglang(args) -> None:
     detected_version = _preflight(args, engine="sglang", base_url=args.base_url)
     config = LiveSglangConfig(
@@ -950,7 +529,7 @@ def cmd_run_live_gateway(args) -> None:
             "VLLM_SERVER_DEV_MODE=1 and pass "
             "--reset-url http://<worker>/reset_prefix_cache?reset_external=true"
         )
-    connector_audit = _connector_audit_or_exit(args)
+    connector_audit = connector_audit_or_exit(args)
     detected_version = _preflight(args, engine="gateway", base_url=args.gateway_url)
     # Resolved before the config, not at write time: the runner derives every
     # X-Request-Id from this id, and a run whose result says one run id while
@@ -995,7 +574,7 @@ def cmd_run_live_gateway(args) -> None:
     before = tuple(scrape_all(metrics_urls))
     run = run_live_gateway_measured(config)
     after = tuple(scrape_all(metrics_urls))
-    requests, audit_join = _join_connector_audit(list(run.requests), connector_audit)
+    requests, audit_join = join_connector_audit(list(run.requests), connector_audit)
     engine = engine_document(
         arm=args.arm,
         flags=engine_flags,
@@ -1013,7 +592,7 @@ def cmd_run_live_gateway(args) -> None:
             **config.__dict__,
             "connector_audit": connector_audit,
             "connector_audit_join": audit_join,
-            "request_id_echo": _request_id_echo(requests),
+            "request_id_echo": request_id_echo(requests),
             "manifest_class_counts": class_counts,
         },
         run=run_metadata,
@@ -1054,156 +633,6 @@ def write_throughput_document(
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(document, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return str(path)
-
-
-def _arm_provenance(payload: dict) -> dict:
-    """What a merged result keeps about one source arm."""
-    return {
-        "run": payload.get("run"),
-        "config": payload.get("config"),
-        "engine": payload.get("engine"),
-    }
-
-
-def cmd_merge_results(args) -> None:
-    """Join two single-arm results into one paired result.
-
-    Arms usually run as separate server processes (stock baseline vs
-    connector), so the pairing has to be reconstructed. It is reconstructed by
-    item_id and nothing else: both arms must have replayed the same manifest
-    bytes, each item must appear exactly once per arm, and the two rows must
-    carry the same manifest-derived fingerprint. Anything else is reported and
-    refused rather than quietly summarized.
-
-    The cold/warm roles come from the command line, so swapping the two flags
-    would invert every speedup in the merged document without a word of
-    complaint. Each arm's own ``run.arm`` label is checked against the role it
-    was passed as, and a contradiction is refused before anything is joined.
-    """
-    from sembench.pairing import (
-        join_arms,
-        merged_run_metadata,
-        requests_from_result,
-        result_manifest_sha256,
-    )
-    from sembench.results import (
-        arm_label_conflicts,
-        arm_pair,
-        arm_pair_conflicts,
-        cold_reference_arm_conflicts,
-        cold_reference_conflicts,
-        result_backend_arm,
-        result_manifest_class_counts,
-    )
-
-    connector_audit = _connector_audit_or_exit(args)
-    try:
-        pair = arm_pair(args.pair) if args.pair else None
-    except ValueError as exc:
-        raise SystemExit(f"merge-results: {exc}") from exc
-    reference_path = getattr(args, "cold_reference", None)
-    try:
-        cold_payload = json.loads(Path(args.cold).read_text(encoding="utf-8"))
-        warm_payload = json.loads(Path(args.warm).read_text(encoding="utf-8"))
-        reference_payload = (
-            json.loads(Path(reference_path).read_text(encoding="utf-8")) if reference_path else None
-        )
-    except (OSError, json.JSONDecodeError) as exc:
-        raise SystemExit(f"merge-results: {exc}") from exc
-
-    conflicts = arm_label_conflicts(cold_payload, warm_payload)
-    if pair is not None:
-        conflicts.extend(arm_pair_conflicts(pair, cold_payload, warm_payload))
-    # M7's reference provenance: --cold-reference-arm is an operator assertion
-    # that defaults to A1, so it is checked against the reference document's
-    # own arm, and a reference that can answer none of this merge's items is
-    # refused rather than published as a scored-nothing zero.
-    reference_rows = requests_from_result(reference_payload) if reference_payload else None
-    reference_arm = result_backend_arm(reference_payload) if reference_payload else ""
-    if reference_payload is not None and reference_rows is not None:
-        conflicts.extend(cold_reference_arm_conflicts(reference_payload, args.cold_reference_arm))
-        conflicts.extend(
-            cold_reference_conflicts(
-                reference_rows,
-                requests_from_result(warm_payload),
-                reference_path=str(reference_path),
-            )
-        )
-    if conflicts:
-        print(
-            json.dumps(
-                {"merged": False, "output": None, "arm_label_conflicts": conflicts},
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        raise SystemExit(1)
-
-    rows, report = join_arms(
-        requests_from_result(cold_payload),
-        requests_from_result(warm_payload),
-        cold_manifest_sha256=result_manifest_sha256(cold_payload),
-        warm_manifest_sha256=result_manifest_sha256(warm_payload),
-    )
-    if not report.ok and not args.allow_unpaired:
-        print(
-            json.dumps(
-                {"merged": False, "output": None, "pairing": report.to_dict()},
-                indent=2,
-                sort_keys=True,
-            )
-        )
-        raise SystemExit(1)
-
-    joined_rows, audit_join = _join_connector_audit(rows, connector_audit)
-    # Both arms replayed the same manifest (the pairing check above refuses
-    # anything else), so either arm's counts are the workload's. The warm arm
-    # is preferred only because it is the one whose metrics they scope.
-    class_counts = result_manifest_class_counts(warm_payload) or result_manifest_class_counts(
-        cold_payload
-    )
-    # M4's per-lookup cost is read off the treatment arm's engine window.
-    warm_engine = warm_payload.get("engine")
-    write_result(
-        args.output,
-        requests=joined_rows,
-        config={
-            "mode": "merge-results",
-            "cold_result": args.cold,
-            "warm_result": args.warm,
-            "allow_unpaired": bool(args.allow_unpaired),
-            "pairing": report.to_dict(),
-            "connector_audit": connector_audit,
-            "connector_audit_join": audit_join,
-            "request_id_echo": _request_id_echo(joined_rows),
-            "manifest_class_counts": class_counts,
-            # M7's cold reference: which document answered as A1, and which
-            # arm that document DECLARES — not the flag, which is an assertion
-            # with no evidence. Null means the merged arms answered for
-            # themselves, which section 4 allows only when the baseline IS A1.
-            "cold_reference_result": reference_path,
-            "cold_reference_arm": reference_arm or None,
-            # Which of section 4's comparisons this document is, when the
-            # operator named one. Null means "an unlabelled cold/warm join".
-            "arm_pair": pair.to_dict() if pair is not None else None,
-            "arms": {
-                "cold": _arm_provenance(cold_payload),
-                "warm": _arm_provenance(warm_payload),
-            },
-        },
-        run=merged_run_metadata(cold_payload, warm_payload, run_id=args.run_id),
-        engine=warm_engine,
-        manifest_class_counts=class_counts,
-        cold_reference=reference_rows,
-        cold_reference_arm=reference_arm or None,
-    )
-    print(
-        json.dumps(
-            {"merged": True, "output": args.output, "pairing": report.to_dict()},
-            indent=2,
-            sort_keys=True,
-        )
-    )
 
 
 def cmd_engine_snapshot(args) -> None:
@@ -1333,245 +762,6 @@ def cmd_calibrate_noise_floor(args) -> None:
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(artifact.to_dict(), indent=2, sort_keys=True), encoding="utf-8")
     print(json.dumps(artifact.to_dict(), indent=2, sort_keys=True))
-
-
-def cmd_assert_result_gates(args) -> None:
-    result = json.loads(Path(args.result).read_text(encoding="utf-8"))
-    aggregate = result.get("aggregate") or {}
-    paired = result.get("paired") or {}
-    engine_summaries = [
-        json.loads(Path(path).read_text(encoding="utf-8")) for path in args.engine_summary
-    ]
-    failures: list[str] = []
-    missing_metrics: list[str] = []
-    requested = set(getattr(args, "requested_gates", None) or ())
-    allow_missing = bool(getattr(args, "allow_missing", False))
-
-    def require(name: str, ok: bool, detail: str) -> None:
-        if not ok:
-            failures.append(f"{name}: {detail}")
-
-    def require_metric(name: str, dest: str, value, ok, detail: str) -> None:
-        """Gate a metric that may be absent from the result.
-
-        An absent metric is not a pass. When the caller explicitly asked for
-        the gate, a missing metric FAILS: silently skipping is how an
-        unmeasured reuse gate goes green. --allow-missing opts back into the
-        skip, on the record.
-        """
-        if value is None:
-            missing_metrics.append(name)
-            if dest in requested and not allow_missing:
-                option = "--" + dest.replace("_", "-")
-                require(
-                    name,
-                    False,
-                    f"metric absent from the result but {option} was requested "
-                    "(pass --allow-missing to skip it deliberately)",
-                )
-            return
-        require(name, ok(float(value)), detail)
-
-    quality = aggregate.get("quality_pass_rate")
-    require_metric(
-        "quality_pass_rate",
-        "min_quality_pass_rate",
-        quality,
-        lambda value: value >= args.min_quality_pass_rate,
-        f"{quality} < {args.min_quality_pass_rate}",
-    )
-    semantic_placement = aggregate.get("semantic_placement_rate_by_request")
-    require_metric(
-        "semantic_placement_rate_by_request",
-        "min_semantic_placement_rate",
-        semantic_placement,
-        lambda value: value >= args.min_semantic_placement_rate,
-        f"{semantic_placement} < {args.min_semantic_placement_rate}",
-    )
-    backend_rate = aggregate.get("backend_confirmed_block_rate")
-    require_metric(
-        "backend_confirmed_block_rate",
-        "min_backend_confirmed_block_rate",
-        backend_rate,
-        lambda value: value >= args.min_backend_confirmed_block_rate,
-        f"{backend_rate} < {args.min_backend_confirmed_block_rate}",
-    )
-    negative_rate = aggregate.get("negative_control_backend_confirmed_rate")
-    require_metric(
-        "negative_control_backend_confirmed_rate",
-        "max_negative_control_confirmed_rate",
-        negative_rate,
-        lambda value: value <= args.max_negative_control_confirmed_rate,
-        f"{negative_rate} > {args.max_negative_control_confirmed_rate}",
-    )
-    negative_semantic_placement = aggregate.get("negative_control_semantic_placement_rate")
-    require_metric(
-        "negative_control_semantic_placement_rate",
-        "max_negative_control_semantic_placement_rate",
-        negative_semantic_placement,
-        lambda value: value <= args.max_negative_control_semantic_placement_rate,
-        f"{negative_semantic_placement} > {args.max_negative_control_semantic_placement_rate}",
-    )
-
-    materialization_events = sum(
-        int(summary.get("materialization_events") or 0) for summary in engine_summaries
-    )
-    materialized_tokens = sum(
-        int(summary.get("materialized_tokens") or 0) for summary in engine_summaries
-    )
-    materialized_units = sum(
-        int(summary.get("materialized_units") or 0) for summary in engine_summaries
-    )
-    materialized_reuse = any(
-        bool(summary.get("materialized_semantic_kv_reuse")) for summary in engine_summaries
-    )
-    engine_errors = [error for summary in engine_summaries for error in summary.get("errors", [])]
-
-    require(
-        "materialization_events",
-        materialization_events >= args.min_materialization_events,
-        f"{materialization_events} < {args.min_materialization_events}",
-    )
-    require(
-        "materialized_tokens",
-        materialized_tokens >= args.min_materialized_tokens,
-        f"{materialized_tokens} < {args.min_materialized_tokens}",
-    )
-    require(
-        "materialized_units",
-        materialized_units >= args.min_materialized_units,
-        f"{materialized_units} < {args.min_materialized_units}",
-    )
-    if args.require_materialized_reuse:
-        require(
-            "materialized_reuse",
-            materialized_reuse,
-            "no engine summary proved materialization",
-        )
-    if args.require_no_engine_errors:
-        require("engine_errors", not engine_errors, f"{len(engine_errors)} errors present")
-
-    # Every gate below reads `paired`, which is null unless the run produced
-    # both arms. A null paired block used to make those gates evaporate, so a
-    # single-arm result could satisfy a speedup gate it never measured.
-    paired_present = result.get("paired") is not None
-    paired_gates = requested & {
-        "min_blended_ttft_speedup",
-        "max_negative_control_speedup_deviation",
-        "max_warm_vs_cold_rouge_drop",
-    }
-    if args.require_contamination_check:
-        paired_gates = paired_gates | {"require_contamination_check"}
-    if paired_gates and not paired_present and not allow_missing:
-        missing_metrics.append("paired")
-        require(
-            "paired_summary",
-            False,
-            "result has no paired summary, so "
-            f"{', '.join(sorted(paired_gates))} cannot be evaluated: run the gateway "
-            "with --paired, or join two single-arm results with `sembench merge-results`",
-        )
-
-    # The gate reads the MEDIAN of the paired ratios, never the mean. Speedups
-    # are ratios, so one pair whose cold arm stalled carries a mean over a
-    # threshold the typical pair never reached. The mean stays in the document
-    # as a secondary number; it is not gateable. A result that carries only the
-    # mean has no median to evaluate, and an absent metric is not a pass.
-    blended = paired.get("blended_ttft_speedup_median")
-    if args.min_blended_ttft_speedup is not None:
-        require_metric(
-            "blended_ttft_speedup_median",
-            "min_blended_ttft_speedup",
-            blended,
-            lambda value: value >= args.min_blended_ttft_speedup,
-            f"{blended} < {args.min_blended_ttft_speedup} (median of paired cold/warm ratios)",
-        )
-    # The control gate reads the MEDIAN, for the same reason the headline gate
-    # does: these are ratios. One control pair whose cold arm hit a slow
-    # prefill carries a mean far enough from 1.0 to fail a deviation gate on
-    # its own, which reports contamination that did not happen — and the same
-    # arithmetic in the other direction hides one that did. The CI is
-    # published beside the point estimate so a "passing" control measured over
-    # four pairs is visibly a control measured over four pairs.
-    negative_speedup = paired.get("negative_control_ttft_speedup_median")
-    negative_speedup_ci = paired.get("negative_control_ttft_speedup_median_ci")
-    if args.max_negative_control_speedup_deviation is not None:
-        require_metric(
-            "negative_control_ttft_speedup_median",
-            "max_negative_control_speedup_deviation",
-            negative_speedup,
-            lambda value: abs(value - 1.0) <= args.max_negative_control_speedup_deviation,
-            f"|{negative_speedup} - 1.0| > {args.max_negative_control_speedup_deviation} "
-            f"(median of the negative-control pairs; 95% CI {negative_speedup_ci})",
-        )
-    if args.require_contamination_check:
-        require(
-            "paired_contamination",
-            paired.get("pairs_contaminated") == 0,
-            f"{paired.get('pairs_contaminated')} contaminated pairs present",
-        )
-
-    warm_vs_cold = paired.get("warm_vs_cold_output_rouge_l_mean")
-    if args.max_warm_vs_cold_rouge_drop is not None:
-        if args.noise_floor_calibration is None:
-            raise SystemExit(
-                "--max-warm-vs-cold-rouge-drop requires --noise-floor-calibration: "
-                "quality gates are calibration-relative, never absolute"
-            )
-        from sembench.calibration import load_calibration
-
-        calibration = load_calibration(args.noise_floor_calibration)
-        floor = calibration.rouge_l_mean - args.max_warm_vs_cold_rouge_drop
-        require(
-            "warm_vs_cold_rouge_vs_floor",
-            warm_vs_cold is not None and float(warm_vs_cold) >= floor,
-            f"{warm_vs_cold} < calibrated floor {calibration.rouge_l_mean:.4f} "
-            f"- allowed drop {args.max_warm_vs_cold_rouge_drop}",
-        )
-        # A warm-vs-cold similarity ABOVE the cold/cold self-agreement band is
-        # itself suspicious (suggests the cold arm was warm): flag, don't pass silently.
-        ceiling = min(1.0, calibration.rouge_l_ci.get("hi", 1.0) + 0.10)
-        if warm_vs_cold is not None and float(warm_vs_cold) > ceiling:
-            require(
-                "warm_vs_cold_rouge_above_plausible_band",
-                False,
-                f"{warm_vs_cold} > {ceiling:.4f} — implausibly high; check cold-arm contamination",
-            )
-
-    payload = {
-        "result": args.result,
-        "engine_summaries": args.engine_summary,
-        "passed": not failures,
-        "failures": failures,
-        "observed": {
-            "quality_pass_rate": quality,
-            "semantic_placement_rate_by_request": semantic_placement,
-            "backend_confirmed_block_rate": backend_rate,
-            "negative_control_backend_confirmed_rate": negative_rate,
-            "negative_control_semantic_placement_rate": negative_semantic_placement,
-            "materialization_events": materialization_events,
-            "materialized_tokens": materialized_tokens,
-            "materialized_units": materialized_units,
-            "materialized_reuse": materialized_reuse,
-            "engine_error_count": len(engine_errors),
-            "paired_present": paired_present,
-            "pairs_used": paired.get("pairs_used"),
-            "blended_ttft_speedup_median": blended,
-            "blended_ttft_speedup_mean": paired.get("blended_ttft_speedup_mean"),
-            "negative_control_pairs": paired.get("negative_control_pairs"),
-            "negative_control_ttft_speedup_median": negative_speedup,
-            "negative_control_ttft_speedup_median_ci": negative_speedup_ci,
-            # Secondary and not gateable, published so the two can be compared
-            # when they disagree.
-            "negative_control_ttft_speedup_mean": paired.get("negative_control_ttft_speedup_mean"),
-        },
-        "requested_gates": sorted(requested),
-        "missing_metrics": sorted(set(missing_metrics)),
-        "allow_missing": allow_missing,
-    }
-    print(json.dumps(payload, indent=2, sort_keys=True))
-    if failures:
-        raise SystemExit(1)
 
 
 def cmd_run_load(args) -> None:

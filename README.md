@@ -264,17 +264,22 @@ Without a reference run, an A4-vs-A6 merge publishes
 `propagation_contamination_rate: null` and
 `propagation_cold_reference_missing: true` rather than comparing two arms that
 can be contaminated together — and that holds whether or not the merge was
-labelled `--pair m7_propagation`, because `run.baseline_id` carries the cold
-arm's `--backend-id` and M7 reads it. Merges whose baseline already *is* A1
+labelled `--pair m7_propagation`, because `run.baseline_arm_declared` carries
+the cold arm's `--backend-id` and M7 reads it. Merges whose baseline already *is* A1
 (`m3_ttft`, `m6_noise_floor`, or a join that declares A1) need no reference
 run.
 
 **A merge that identifies no arm gets no rate either.** `--backend-id` defaults
-to empty, so a plain `merge-results` stamps `run.baseline_id` from the cold
-*run id* — and a backend id naming a build (`vllm-0.29-span`) resolves to no
-arm — which is indistinguishable from an unlabelled A4-vs-A6 merge. Such a
-document publishes a null rate with `propagation_cold_reference_arm:
-"undeclared"`; pass `--backend-id`, `--pair`, or `--cold-reference` to get M7.
+to empty, so a plain `merge-results` declares no baseline arm at all — and a
+backend id naming a build (`vllm-0.29-span`) resolves to no arm — which is
+indistinguishable from an unlabelled A4-vs-A6 merge. Such a document publishes
+a null rate with `propagation_cold_reference_arm: "undeclared"`; pass
+`--backend-id`, `--pair`, or `--cold-reference` to get M7. The cold **run id**
+is never read as a declaration: `run.baseline_id` falls back to it so the
+document says which run was the baseline, but M7 reads
+`run.baseline_arm_declared`, which only an operator's `--backend-id` /
+`--baseline-id` fills in. A run called `phase0-g5-a1-rack-cold` therefore
+unlocks nothing.
 
 ## Engine Counters (the external-KV split)
 

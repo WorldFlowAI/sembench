@@ -113,8 +113,8 @@ def cold_reference_for(
       document declares for itself (the CLI checks it), and None means it
       declared none, which the source records instead of asserting A1;
     - the baseline arm IS section 4's cold reference — a pair whose baseline is
-      A1, or an unlabelled join whose ``run.baseline_id`` names A1 — so the
-      pair's own cold twin answers.
+      A1, or an unlabelled join whose ``run.baseline_arm_declared`` names A1 —
+      so the pair's own cold twin answers.
 
     Both remaining shapes are ``missing``, because on neither does anything
     say an A1 run took part:
@@ -122,21 +122,25 @@ def cold_reference_for(
     - the baseline is some OTHER known arm (``m7_propagation`` merges A4
       against A6, labelled or not) — the two arms can drift towards the served
       answer together, so the rate would under-report;
-    - the document names no arm anywhere: no ``--pair``, and a baseline id that
-      matches no phase-0 arm. This is the DEFAULT shape — ``--backend-id``
-      defaults to the empty string and a plain ``merge-results`` stamps
-      ``run.baseline_id`` from the cold run_id — so it was the same
+    - the document names no arm anywhere: no ``--pair``, and a declared
+      baseline arm that matches no phase-0 arm. This is the DEFAULT shape —
+      ``--backend-id`` defaults to the empty string, so a plain
+      ``merge-results`` declares nothing at all — and it was the same
       0.0-on-a-contaminated-workload hole one door over: an A4-vs-A6 merge
       that labels nothing is indistinguishable from an A1-vs-A4 merge that
       labels nothing, and "indistinguishable" is not permission to publish.
       The arm reads ``undeclared``, which names the remedy: ``--backend-id``,
       ``--pair``, or ``--cold-reference``.
 
-    ``baseline_arm`` is the merged document's own ``run.baseline_id``, stamped
-    from the cold arm's ``--backend-id``. Reading it is what lets an ordinary
-    A1-vs-A4 merge keep its number without an extra reference run, and it is
-    the only thing that can: a document that declares nothing is not an A1
-    document that forgot to say so.
+    ``baseline_arm`` is the merged document's own ``run.baseline_arm_declared``
+    — the cold arm's ``--backend-id`` / ``--baseline-id``, and nothing else.
+    Reading it is what lets an ordinary A1-vs-A4 merge keep its number without
+    an extra reference run, and it is the only thing that can: a document that
+    declares nothing is not an A1 document that forgot to say so. It is
+    deliberately NOT ``run.baseline_id``, which falls back to the cold run's id
+    when no arm was declared: ``arm_id_of`` matches an arm name anywhere in a
+    free-text id, so a run called ``phase0-g5-a1-rack-cold`` would otherwise
+    resolve to A1 and publish M7 against an arm nobody identified.
     """
     if reference_rows:
         declared = str(reference_arm or "").strip()
@@ -282,16 +286,35 @@ def _count_propagation(
     )
 
 
+def _nothing_was_scored(probe_set: int, counts: _PropagationCounts) -> bool:
+    """Did a non-empty probe set yield no scored probe at all?
+
+    Whatever supplied the cold answer, a document that read ZERO probes has no
+    evidence about contamination: the numerator can only be 0, so the headline
+    would be ``0 / |probe set|`` — a clean contamination number produced
+    entirely by failure to measure, which is the one direction this metric must
+    never drift. Every way of getting there counts: probes with no parent link,
+    a parent that never answered, probes excluded for an unclean pair, a probe
+    set the run never replayed, or a reference that answered none of them.
+
+    The rate, its numerator and the scored-only rate are therefore null here
+    regardless of source, and the exclusion counters beside them say which way
+    it happened. An empty probe set is not this case — a workload with no
+    probes measured nothing to report rather than failing to read something.
+    """
+    return probe_set > 0 and counts.scored == 0
+
+
 def _reference_scored_nothing(reference: ColdReference, counts: _PropagationCounts) -> bool:
-    """Was a reference run supplied that scored no probe at all?
+    """Was a reference run SUPPLIED that scored no probe at all?
 
     ``cold_reference_for`` marks a reference present as soon as it holds rows,
     but a reference from another manifest, or one whose rows are all the warm
     arm, yields no cold answer for any probe: every probe lands in
-    ``propagation_probes_without_cold_reference`` and the rate would be 0 over
-    the whole probe set. That is the failure the explicit reference exists to
-    prevent, one door over, so it suppresses the rate exactly as an absent
-    reference does.
+    ``propagation_probes_without_cold_reference``. :func:`_nothing_was_scored`
+    already nulls the rate for that; this narrower predicate is what keeps the
+    supplied-but-useless reference distinguishable from a document that simply
+    scored nothing, under ``propagation_cold_reference_unusable``.
     """
     return (
         reference.source
@@ -340,10 +363,13 @@ def _propagation_summary(
     reference run's rows, ``propagation_cold_reference_arm`` and
     ``propagation_cold_reference_source`` say what answered, and on a document
     whose baseline is not A1 and that was given no reference run the rate is
-    **null** with ``propagation_cold_reference_missing`` true. A reference that
-    was supplied and scored no probe at all (another manifest, or rows stamped
-    as the warm arm) is the same hole one door over and is nulled the same way,
-    under ``propagation_cold_reference_unusable``. The
+    **null** with ``propagation_cold_reference_missing`` true. A document that
+    scored no probe at all is the same hole one door over — the rate could only
+    read 0 over the probe set, produced by failing to read it — so it is nulled
+    the same way whatever the source, under ``propagation_no_probe_scored``,
+    with ``propagation_cold_reference_unusable`` naming the case where a
+    reference WAS supplied and answered nothing (another manifest, or rows
+    stamped as the warm arm). The
     baseline-referenced number is still computed — it is a useful arm-vs-arm
     diagnostic — but only under
     ``propagation_contamination_rate_vs_baseline_arm``, where nobody can read
@@ -391,7 +417,11 @@ def _propagation_summary(
     # set there is the same 0.0-on-a-contaminated-workload the explicit
     # reference exists to prevent, so it is nulled and named.
     unusable = _reference_scored_nothing(reference, counts)
-    published = None if reference.missing or unusable else counts.propagated
+    # ... and the same hole with no reference involved: a probe set none of
+    # whose members could be read publishes no rate either, whichever arm was
+    # going to answer as cold.
+    no_probe_scored = _nothing_was_scored(probe_set, counts)
+    published = None if reference.missing or unusable or no_probe_scored else counts.propagated
     return {
         "propagation_definition": (
             "share of the propagation_probe SET whose treatment-arm answer is closer to the "
@@ -411,6 +441,10 @@ def _propagation_summary(
         # Distinct from _missing (none was supplied at all) and published so a
         # null rate cannot be read as "the reference was fine".
         "propagation_cold_reference_unusable": unusable,
+        # Not one probe of a non-empty probe set could be scored, by any route.
+        # The rate is null here whatever supplied the cold answer, because 0
+        # propagated out of 0 read is not a contamination measurement.
+        "propagation_no_probe_scored": no_probe_scored,
         "propagation_contamination_rate": (
             None if published is None else _rate_or_none(published, probe_set)
         ),

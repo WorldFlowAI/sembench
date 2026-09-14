@@ -906,9 +906,15 @@ def test_a_probe_whose_pair_was_not_clean_is_counted_not_dropped():
     assert paired is not None
     assert paired["propagation_probes_excluded_unclean_pair"] == 1
     assert paired["propagation_probe_pairs"] == 0
+    # The excluded probe stays in the denominator rather than shrinking it...
     assert paired["propagation_contamination_denominator"] == 2
-    assert paired["propagation_contamination_numerator"] == 0
-    assert paired["propagation_contamination_rate"] == 0.0
+    # ...and since it was the only probe, nothing at all was read: publishing
+    # 0/2 here would be a contamination number produced by the exclusion
+    # itself, so the rate is null under propagation_no_probe_scored and the
+    # exclusion counter above carries the finding (round 6, fourth pass).
+    assert paired["propagation_no_probe_scored"] is True
+    assert paired["propagation_contamination_numerator"] is None
+    assert paired["propagation_contamination_rate"] is None
     assert paired["propagation_contamination_rate_scored_only"] is None
 
 

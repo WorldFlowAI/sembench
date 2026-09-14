@@ -213,8 +213,11 @@ def write_result(
     (``merge-results --cold-reference``). The comparison this document is
     (``--pair``) is read back out of ``config``, so a document always applies
     the population rules of the pair it declares — and when it declares no
-    pair, ``run.baseline_id`` still says which arm supplied the cold rows, so
-    M7 reads that rather than assuming the baseline is A1.
+    pair, ``run.baseline_arm_declared`` still says which arm supplied the cold
+    rows, so M7 reads that rather than assuming the baseline is A1. It is that
+    field and not ``run.baseline_id``: the latter is run identity and falls
+    back to the cold RUN ID on a merge, and a run id that happens to contain
+    "a1" is not an operator saying the baseline was A1.
     """
     out = Path(path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -235,7 +238,7 @@ def write_result(
             manifest_class_counts=manifest_class_counts,
             engine=engine,
             arm_pair=result_arm_pair_name(config),
-            baseline_arm=(run.baseline_id if run is not None else None),
+            baseline_arm=(run.baseline_arm_declared if run is not None else None),
             cold_reference=cold_reference,
             cold_reference_arm=cold_reference_arm,
         ),

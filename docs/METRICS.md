@@ -544,6 +544,21 @@ ad_hoc           wrapper_rank >= 2   (w3-extractive … w8-workflow)
 unstratified     wrapper_rank null   (the manifest named no wrapper)
 ```
 
+**`ad_hoc` is the plan's word for this stratum, not a description of the
+traffic in it.** Stream B draws all eight wrappers from one fixed shared set
+(`phase0-build-manifest.py`: `WRAPPERS`, sampled by
+`zipf_weights(len(WRAPPERS), 1.1)`), so **no item in this workload carries a
+one-off wrapper of its own**: ranks 2–7 are shared wrappers that are merely
+unpopular — the tail of the popularity order — and their rank counts are
+`{0: 479, 1: 222, 2: 161, 3: 101, 4: 104, 5: 75, 6: 55, 7: 53}`. Quote the
+`ad_hoc` number as *tail-popularity* traffic; a reader told "the ad-hoc stratum
+aligns at 1.03" will otherwise believe ad-hoc traffic was measured. The same
+sentence travels in every document inside `wrapper_stratum_rule`. Nor is the
+boundary a natural break in the distribution: the head is a thin 56.1% majority
+and rank 1 (17.8% of rows) sits about five points above rank 2 (12.9%) — it is
+the smallest prefix carrying a majority, which is a stated rule and not a gap
+in the data.
+
 **This boundary is an interpretation, and here is the one it rejected.** The
 plan asks for the split (line 343) and defines neither "shared-wrapper" nor
 "ad-hoc". The wording it uses elsewhere is pairwise — caveat A is about "the
@@ -575,8 +590,8 @@ population the donor's wrapper differs from the recipient's by construction
 `phase0-stream-b.jsonl`, the 225 that name a `donor_item_id` share the
 recipient's `wrapper_id` in **zero** cases), which is precisely why the
 identity reading was rejected two paragraphs up. Everything below the head is
-ad-hoc traffic whose recipient wrapper is usually cold, so the token-level tail
-alignment is a property of is a different one.
+traffic on a tail wrapper whose recipient wrapper is usually cold, so the
+token-level tail alignment is a property of is a different one.
 
 **The constant is pinned, so the document checks it.** `SHARED_WRAPPER_MAX_RANK`
 is derived from that manifest and hardcoded, and on a manifest with a different
@@ -742,9 +757,10 @@ propagation_cold_reference_arm            never null, and never provenance when
                                           _missing is true. Three shapes: an arm id
                                           ("A1") = that arm answered; "undeclared" =
                                           neither the reference document nor
-                                          run.baseline_id named an arm; "required: A1" =
-                                          the baseline is a known arm that is NOT the
-                                          cold reference, so A1 is still needed
+                                          run.baseline_arm_declared named an arm;
+                                          "required: A1" = the baseline is a known arm
+                                          that is NOT the cold reference, so A1 is
+                                          still needed
 propagation_cold_reference_source         "reference_arm" | "reference_arm_undeclared"
                                           | "baseline_arm"; null whenever _missing
 propagation_cold_reference_missing        true when no arm on this document answered as
@@ -753,6 +769,10 @@ propagation_cold_reference_missing        true when no arm on this document answ
 propagation_cold_reference_unusable       true when one was SUPPLIED and scored no
                                           probe at all (wrong manifest, rows stamped
                                           warm, every probe position-mismatched)
+propagation_no_probe_scored               true when a non-empty probe set yielded no
+                                          scored probe by ANY route; the rate, its
+                                          numerator and the scored-only rate are null
+                                          whatever supplied the cold answer
 propagation_contamination_rate_vs_baseline_arm
                                           the same comparison against THIS document's
                                           baseline arm; a diagnostic, never section 4's
@@ -796,22 +816,30 @@ comparison finds no difference, and a fully contaminated workload can publish
   source `reference_arm_undeclared`, rather than published as an asserted A1
   nothing verified.
 - With no reference run, a document whose baseline **is** A1 — `--pair
-  m3_ttft` / `m6_noise_floor`, or an unlabelled join whose `run.baseline_id`
-  names A1 — answers from its own cold twin, and the source reads
-  `baseline_arm`.
+  m3_ttft` / `m6_noise_floor`, or an unlabelled join whose
+  `run.baseline_arm_declared` names A1 — answers from its own cold twin, and
+  the source reads `baseline_arm`.
 - With no reference run on a document whose baseline is not A1, there is no
   cold answer at all: `propagation_contamination_rate`, its numerator and the
   scored-only rate are **null**, `propagation_cold_reference_missing` is true,
   every probe is counted in `propagation_probes_without_cold_reference`, and
   `propagation_cold_reference_arm` reads `required: A1` — a requirement, not a
   claim that A1 was consulted. This is read off `--pair` **and** off
-  `run.baseline_id`, which the merge stamps from the cold arm's
-  `--backend-id`: `--pair` is optional, so an A4 vs A6 merge that nobody
-  labelled is still an m7-shaped merge and still gets no rate.
+  `run.baseline_arm_declared`, which the merge stamps from the cold arm's
+  `--backend-id` / `--baseline-id`: `--pair` is optional, so an A4 vs A6 merge
+  that nobody labelled is still an m7-shaped merge and still gets no rate.
+- **A run id is never an arm declaration.** `run.baseline_id` is run
+  *identity* and falls back to the cold **run id** when the cold arm declared
+  no label, and `arm_id_of` matches an arm name anywhere in a free-text id — so
+  a run called `phase0-g5-a1-rack-cold` would resolve to A1. M7 therefore reads
+  `run.baseline_arm_declared`, which carries the operator's declaration and has
+  no such fallback (empty when none was made). The two fields are both written
+  on every document: read `baseline_id` to learn which run was the baseline,
+  `baseline_arm_declared` to learn which arm it said it was.
 - **A document that identifies no arm at all gets no rate either**, and that
-  is the default shape: `--backend-id` defaults to the empty string, a plain
-  `merge-results` stamps `run.baseline_id` from the cold **run id**, and a
-  backend id that names a build rather than an arm (`vllm-0.29-span`,
+  is the default shape: `--backend-id` defaults to the empty string, so a plain
+  `merge-results` declares no baseline arm at all, and a backend id that names
+  a build rather than an arm (`vllm-0.29-span`,
   `sglang-fuzzy-pr31057`) resolves to no arm. Such a document is
   indistinguishable from an A4-vs-A6 merge that labelled nothing, so it is
   suppressed the same way, with `propagation_cold_reference_arm: "undeclared"`
@@ -821,15 +849,24 @@ comparison finds no difference, and a fully contaminated workload can publish
   Through round 6's second pass this branch still published the number, which
   is the same 0.0-on-a-contaminated-workload the explicit reference exists to
   prevent, reachable with default flags and no optional argument at all.
-- A reference that was supplied and **scored no probe at all** — a run of
-  another manifest, an already-merged document whose rows are all stamped
-  `arm='warm'`, or every probe position-mismatched — is the same hole one door
-  over: it would publish `0 / |probe set|` beside
-  `propagation_cold_reference_missing: false`. The rate, its numerator and the
-  scored-only rate are null there too, under
-  `propagation_cold_reference_unusable: true` so it cannot be confused with
-  "no reference was given". `merge-results` refuses such a reference outright
-  when it shares no item with the merged arms.
+- **A document that scored no probe at all publishes no rate**, whatever
+  supplied the cold answer. A non-empty probe set none of whose members could
+  be read — every probe unlinked, every parent absent, every pair excluded as
+  unclean, the probe set never replayed, or a reference that answered none of
+  them — can only produce `0 / |probe set|`, a clean contamination number
+  manufactured entirely by failing to measure. The rate, its numerator and the
+  scored-only rate are null there under `propagation_no_probe_scored: true`,
+  and the exclusion counters below say which way it happened. This is
+  source-independent on purpose: the identical condition used to publish `0.0`
+  when the cold answer came from the document's own A1 baseline arm and null
+  when it came from a supplied reference.
+  `propagation_cold_reference_unusable: true` remains the narrower flag for the
+  supplied-reference case (another manifest, rows stamped `arm='warm'`, every
+  probe position-mismatched), so that case stays distinguishable from "no
+  reference was given" and from "nothing was scored". `merge-results` refuses
+  such a reference outright when it shares no item with the merged arms.
+  An **empty** probe set is not this case: a workload with no probes had
+  nothing to read, and its rate is null because 0/0 is.
 
 `propagation_contamination_rate_vs_baseline_arm` is always published: it is the
 same comparison taken against whatever this document calls its baseline. It is
