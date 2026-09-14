@@ -823,20 +823,42 @@ def test_the_connector_audit_flag_is_documented_and_accepted():
 def test_the_documented_audit_metric_keys_are_the_keys_the_code_emits():
     """The drift this whole round exists to stop: a metric named in the docs
     that the result does not carry."""
-    from sembench.results import connector_audit_metrics
+    from sembench.results import connector_audit_metrics, paired_summary
 
     emitted = set(connector_audit_metrics([]))
     for key in (
+        "alignment_given_match",
+        "alignment_given_opportunity",
+        "boundary_miss_breakdown",
         "boundary_alignment_rate",
         "materialized_reuse_rate",
         "materialized_reuse_token_rate",
-        "propagation_contamination_rate",
+        "materialized_reuse_request_rate",
+        "propagation_cached_without_materialization_rate",
+        "prefix_blocks_evicted",
         "connector_audit_present",
         "connector_audit_rows_joined",
     ):
         assert key in emitted, f"{key} is documented but the result does not carry it"
         assert key in FLAT_README
         assert key in FLAT_METRICS
+
+    # M7 is a cross-arm comparison and lives in the paired block, not in the
+    # per-arm audit metrics.
+    paired = paired_summary(_paired_rows_for_key_check())
+    assert paired is not None
+    for key in ("propagation_contamination_rate", "propagation_probes_without_served_answer"):
+        assert key in paired, f"{key} is documented but the paired summary does not carry it"
+        assert key in FLAT_README
+        assert key in FLAT_METRICS
+
+
+def _paired_rows_for_key_check() -> list[RequestMetrics]:
+    """One cold/warm pair, enough for paired_summary to return a document."""
+    return [
+        RequestMetrics(**_arm_row("i1", ttft=200.0, arm="cold")),
+        RequestMetrics(**_arm_row("i1", ttft=100.0, arm="warm")),
+    ]
 
 
 def test_the_docs_map_each_audit_metric_to_its_spec_number():

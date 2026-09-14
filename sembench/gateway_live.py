@@ -25,7 +25,7 @@ from sembench.request_ids import (
     sending_request_id,
     stamp_request_id,
 )
-from sembench.schema import RequestMetrics, WorkloadItem, read_jsonl
+from sembench.schema import RequestMetrics, WorkloadItem, manifest_expectations, read_jsonl
 from sembench.throughput import request_record, summarize_throughput
 from sembench.tokenization import load_tokenizer
 
@@ -710,6 +710,11 @@ def _metrics_from_item(
     direct_worker = recipient_url if recipient_url in tuple(worker_urls) else None
 
     return RequestMetrics(
+        # The manifest's half of the audit join: what the offline model
+        # predicted the connector would supply, which traffic class this item
+        # is, and which item a propagation probe repeats. Nothing else fills
+        # these, and every audit-derived metric is computed against them.
+        **manifest_expectations(item),
         item_id=item.item_id,
         dataset=item.dataset,
         transform=item.transform,
@@ -742,6 +747,12 @@ def _metrics_from_item(
         quality_f1=answer_f1,
         quality_rouge_l=answer_rouge,
         arm=arm,
+        # The engine's own id for this request. Compared against the id the
+        # runner sent (cli: request_id_echo) so a front end that rewrites or
+        # strips X-Request-Id is reported, not silently unjoinable.
+        engine_response_id=(
+            None if response.get("response_id") is None else str(response["response_id"])
+        ),
         engine_ttft_ms=timing["engine_ttft_ms"],
         queue_time_ms=timing["queue_time_ms"],
         flush_contaminated=cold_arm_contaminated(

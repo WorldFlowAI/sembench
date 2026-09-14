@@ -280,23 +280,54 @@ Because the ids are derived, a re-run of the same manifest under the same
 `--run-id` re-derives the same ids, and an audit written on a worker joins to a
 result written anywhere else with neither side keeping a table.
 
+The engine also echoes its own id on every chunk, so each row keeps both the
+id that was sent (`engine_request_id`) and the id that came back
+(`engine_response_id`), and the result's `config.request_id_echo` counts the
+mismatches. A front end that strips `X-Request-Id` makes vLLM mint its own id,
+which downstream is the same null as an arm that materialized nothing —
+`rows_id_mismatched` is what separates the two.
+
+The manifest supplies the other half of the join, stamped onto every row by
+the runner: `expected_supplied_tokens`, `expected_span_target_start`,
+`traffic_class` and (for a probe) `parent_item_id`. An absent key stamps
+`null`, never `0`.
+
 What the join adds to the result — always beside its own numerator and
 denominator, so `0.0` over three requests is never read as `0.0` over three
 hundred:
 
-- `boundary_alignment_rate` (M1) — among rows whose manifest says a compatible
-  donor existed, the fraction whose audited boundary landed where the manifest
-  expected. A row that only ever produced `semantic_span_boundary_missed` stays
-  in the denominator; the miss is the measurement.
-- `materialized_reuse_rate` (M2) — among rows that advertised a load, the
-  fraction that also carried `runtime_materialized`. `materialized_reuse_token_rate`
-  beside it is the spec's token-weighted form
-  (Σ materialized tokens / Σ advertised tokens). They answer different
-  questions and neither substitutes for the other.
-- `propagation_contamination_rate` (M7, the spec's "contamination /
-  propagation rate") — among `propagation_probe` rows, the fraction that
-  materialized nothing of their own yet still reported cached tokens.
-- `connector_audit_present` / `connector_audit_rows_joined`, and a
+- **M1, three numbers, all conditioned on `boundary > 0`.**
+  `alignment_given_match` divides the advertises by the lookup hits (when the
+  provider found a donor, did the boundary land on a span?);
+  `alignment_given_opportunity` divides them by the manifest's
+  `same_doc_new_instruction ∪ revised_doc` items (of the traffic that should
+  have been reusable, how much was served?) and is the headline —
+  `boundary_alignment_rate` is its alias and nothing else.
+  `boundary_miss_breakdown` partitions the misses into `donor_not_captured` /
+  `donor_too_short` / `below_min_semantic_span` / `true_misalignment`, so a
+  low alignment rate comes with its diagnosis. Beside them,
+  `expected_supplied_tokens_agreement_rate` checks the live planner against the
+  offline model.
+- **M2, token-weighted.** `materialized_reuse_rate` is
+  Σ `runtime_materialized` tokens / Σ advertised `token_count`
+  (`materialized_reuse_token_rate` is an alias of it). The request-count
+  question — how many advertising requests got any of their promise — is
+  `materialized_reuse_request_rate`, and neither substitutes for the other.
+- **M7 is cross-arm and lives in the `paired` block.**
+  `propagation_contamination_rate` is the share of `propagation_probe` items
+  whose treatment answer is closer to the *served* answer (their parent item's
+  answer in the same arm) than to the *cold* answer (their own answer in the
+  baseline arm). Probes it could not score are counted, never dropped:
+  `propagation_probes_without_served_answer`, `propagation_probes_unlinked`,
+  `propagation_probes_without_answers`. Read it beside `prefix_blocks_evicted`
+  — until that counter reads non-zero on a contaminated workload, every
+  lane-2 quality number is unproven, including a favourable one. The per-row
+  `propagation_cached_without_materialization_rate` is a supporting signal,
+  not M7.
+- `connector_audit_present` / `connector_audit_rows_joined`, the two exclusion
+  counters (`connector_audit_rows_excluded_cold_arm` /
+  `..._excluded_not_joined` — every rate above is computed over rows that
+  could have been audited, never over a cold arm), and a
   `config.connector_audit_join` report counting rows matched exactly, matched
   after normalization, unmatched, ambiguous, and without an id at all.
 
@@ -389,9 +420,17 @@ See [docs/METRICS.md](docs/METRICS.md) for the exact metric contract.
   wall span also contains the dispatcher's own donor-gap and settle waits,
   which are the harness's delay and not latency the engine produced. TTFT is
   unaffected; it is still measured at the streamed first token.
-- `boundary_alignment_rate` / `materialized_reuse_rate` /
-  `propagation_contamination_rate`: M1, M2 and M7, available only on a result
-  joined against the connector audit (`--connector-audit`). `null` until then.
+- `alignment_given_match` / `alignment_given_opportunity` (alias:
+  `boundary_alignment_rate`) / `boundary_miss_breakdown`: M1. `null` until the
+  result is joined against a connector audit (`--connector-audit`).
+- `materialized_reuse_rate` (token-weighted; alias
+  `materialized_reuse_token_rate`) and `materialized_reuse_request_rate`: M2,
+  the mass that arrived and the requests that got any of it.
+- `propagation_contamination_rate` (+ `propagation_probes_without_served_answer`
+  and the other exclusion counts) in the `paired` block, and
+  `prefix_blocks_evicted` beside it: M7 and the counter that gates lane-2
+  quality. `propagation_cached_without_materialization_rate` is the
+  supporting per-row signal.
 - `blended_ttft_speedup_median` (+ `_ci`): the headline paired speedup and the
   number `--min-blended-ttft-speedup` gates. Speedups are ratios and ratios are
   heavy-tailed, so one stalled cold arm can carry a mean over a bar the typical

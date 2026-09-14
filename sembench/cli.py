@@ -170,8 +170,9 @@ def _add_connector_audit_arg(parser: argparse.ArgumentParser) -> None:
         default=None,
         metavar="PATH",
         help="SemBlend vLLM connector audit JSONL (the connector's audit_path) to join this "
-        "result against by request_id; source of boundary_alignment_rate (M1), "
-        "materialized_reuse_rate (M2) and propagation_rate (M7)",
+        "result against by request_id; source of alignment_given_match / "
+        "alignment_given_opportunity / boundary_miss_breakdown (M1), materialized_reuse_rate "
+        "(M2, token-weighted) and prefix_blocks_evicted (M7's gating counter)",
     )
 
 
@@ -210,6 +211,20 @@ def _join_connector_audit(requests: list, connector_audit: str | None) -> tuple[
     except AuditError as exc:
         raise SystemExit(f"connector audit: {exc}") from exc
     return list(joined), report.to_dict()
+
+
+def _request_id_echo(requests: list) -> dict:
+    """Did the engine adopt the ids the runner sent?
+
+    Reported whether or not an audit was joined: a front end that strips
+    ``X-Request-Id`` makes vLLM mint its own id, and every audit-derived
+    metric then reads as an arm that materialized nothing. The mismatch count
+    is the difference between "no reuse happened" and "the join key never
+    arrived".
+    """
+    from sembench.connector_audit import request_id_echo_report
+
+    return request_id_echo_report(requests)
 
 
 def _engine_flags_or_exit(args):
@@ -953,6 +968,7 @@ def cmd_run_live_gateway(args) -> None:
             **config.__dict__,
             "connector_audit": connector_audit,
             "connector_audit_join": audit_join,
+            "request_id_echo": _request_id_echo(requests),
         },
         run=run_metadata,
         engine=engine_document(
@@ -1073,6 +1089,7 @@ def cmd_merge_results(args) -> None:
             "pairing": report.to_dict(),
             "connector_audit": connector_audit,
             "connector_audit_join": audit_join,
+            "request_id_echo": _request_id_echo(joined_rows),
             "arms": {
                 "cold": _arm_provenance(cold_payload),
                 "warm": _arm_provenance(warm_payload),
@@ -1369,14 +1386,23 @@ def cmd_assert_result_gates(args) -> None:
             lambda value: value >= args.min_blended_ttft_speedup,
             f"{blended} < {args.min_blended_ttft_speedup} (median of paired cold/warm ratios)",
         )
+    # The control gate reads the MEDIAN, for the same reason the headline gate
+    # does: these are ratios. One control pair whose cold arm hit a slow
+    # prefill carries a mean far enough from 1.0 to fail a deviation gate on
+    # its own, which reports contamination that did not happen — and the same
+    # arithmetic in the other direction hides one that did. The CI is
+    # published beside the point estimate so a "passing" control measured over
+    # four pairs is visibly a control measured over four pairs.
+    negative_speedup = paired.get("negative_control_ttft_speedup_median")
+    negative_speedup_ci = paired.get("negative_control_ttft_speedup_median_ci")
     if args.max_negative_control_speedup_deviation is not None:
-        negative_speedup = paired.get("negative_control_ttft_speedup_mean")
         require_metric(
-            "negative_control_ttft_speedup",
+            "negative_control_ttft_speedup_median",
             "max_negative_control_speedup_deviation",
             negative_speedup,
             lambda value: abs(value - 1.0) <= args.max_negative_control_speedup_deviation,
-            f"|{negative_speedup} - 1.0| > {args.max_negative_control_speedup_deviation}",
+            f"|{negative_speedup} - 1.0| > {args.max_negative_control_speedup_deviation} "
+            f"(median of the negative-control pairs; 95% CI {negative_speedup_ci})",
         )
     if args.require_contamination_check:
         require(
@@ -1432,6 +1458,12 @@ def cmd_assert_result_gates(args) -> None:
             "pairs_used": paired.get("pairs_used"),
             "blended_ttft_speedup_median": blended,
             "blended_ttft_speedup_mean": paired.get("blended_ttft_speedup_mean"),
+            "negative_control_pairs": paired.get("negative_control_pairs"),
+            "negative_control_ttft_speedup_median": negative_speedup,
+            "negative_control_ttft_speedup_median_ci": negative_speedup_ci,
+            # Secondary and not gateable, published so the two can be compared
+            # when they disagree.
+            "negative_control_ttft_speedup_mean": paired.get("negative_control_ttft_speedup_mean"),
         },
         "requested_gates": sorted(requested),
         "missing_metrics": sorted(set(missing_metrics)),

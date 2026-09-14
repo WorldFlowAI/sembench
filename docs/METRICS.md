@@ -268,38 +268,173 @@ A `--connector-audit` path that does not exist is refused before the arm issues
 any traffic: a misspelled path and an arm that materialized nothing are
 otherwise the same null.
 
+### Did the engine keep the id? (`config.request_id_echo`)
+
+The join is by construction only as long as the id survives the trip. A front
+end that strips or rewrites `X-Request-Id` makes vLLM mint its own, and every
+audit-derived metric then reads exactly like an arm that materialized nothing.
+The engine echoes its id on every chunk, so each row keeps both — the id that
+was sent (`engine_request_id`) and the id that came back
+(`engine_response_id`) — and the result's config carries the comparison:
+
+```text
+request_id_echo.rows_checked
+request_id_echo.rows_id_echoed                 chatcmpl-<sent> / cmpl-<sent>-0
+request_id_echo.rows_id_mismatched             a front end minted its own id
+request_id_echo.rows_without_engine_response_id
+request_id_echo.mismatch_examples              up to three sent/returned pairs
+```
+
+`rows_id_mismatched > 0` is the difference between "no reuse happened" and
+"the join key never arrived", and it is reported whether or not an audit was
+joined.
+
+### The manifest's half of the join
+
+None of the four inputs below can come from an engine, so `run-live-gateway`'s
+row constructor stamps them from `WorkloadItem.metadata` (via
+`manifest_expectations` in `sembench/schema.py`):
+
+```text
+expected_supplied_tokens       offline prediction: tokens the planner should supply
+expected_span_target_start     offline prediction: where the span should start
+traffic_class                  no_reuse | same_doc_new_instruction | revised_doc |
+                               rope_delta_sweep | exact_repeat | propagation_probe |
+                               reworded_doc
+propagation_parent_item_id     the item a propagation probe repeats verbatim
+```
+
+An absent key stamps `null`, never `0`: "the manifest made no claim" and "the
+manifest predicted nothing would be supplied" are different statements about
+the same item. `expected_boundary_tokens` is deliberately **not** stamped — the
+plan calls it an upper bound whose divergence is routine and legitimate,
+because it depends on live GPU residency, eviction and preemption.
+
 ### What the join produces
 
 ```text
-connector_audit_present            was any audit joined at all
-connector_audit_rows_joined        rows the audit had something to say about
+connector_audit_present                   was any audit joined at all
+connector_audit_rows_joined               rows the audit had something to say about
+connector_audit_rows_considered           rows every rate below was computed over
+connector_audit_rows_excluded_cold_arm    cold rows: no connector ran in that arm
+connector_audit_rows_excluded_not_joined  rows no audit was joined to at all
 
-boundary_alignment_rate            M1  + _numerator / _denominator
-materialized_reuse_rate            M2  + _numerator / _denominator
-materialized_reuse_token_rate      M2, token-weighted (Σ materialized / Σ advertised)
-materialized_reuse_tokens
-materialized_reuse_advertised_tokens
-propagation_contamination_rate     M7  + _numerator / _denominator
+alignment_given_match                     M1  + _numerator / _denominator
+alignment_given_opportunity               M1  + _numerator / _denominator
+boundary_alignment_rate                   alias of alignment_given_opportunity
+boundary_miss_breakdown                   M1, {reason: count}
+expected_supplied_tokens_agreement_rate   M1 integrity check + _numerator / _denominator
+expected_span_target_start_agreement_rate M1 integrity check + _numerator / _denominator
+
+materialized_reuse_rate                   M2, token-weighted (the headline)
+materialized_reuse_tokens                 its numerator
+materialized_reuse_advertised_tokens      its denominator
+materialized_reuse_token_rate             alias of materialized_reuse_rate
+materialized_reuse_request_rate           M2 by request + _numerator / _denominator
+
+prefix_blocks_evicted                     M7's gating counter, + rows_with_prefix_blocks_evicted
+propagation_cached_without_materialization_rate
+                                          M7 supporting signal + _numerator / _denominator
 ```
 
-- **M1 `boundary_alignment_rate`** — among rows whose manifest says a
-  compatible donor existed (`expected_supplied_tokens > 0`), the fraction whose
-  audited boundary equals `expected_span_target_start`. A row that produced
-  only `semantic_span_boundary_missed` stays in the denominator: the miss is
-  the thing being measured.
-- **M2 `materialized_reuse_rate`** — among rows carrying a
-  `semantic_span_load_advertised`, the fraction that also carried a
-  `runtime_materialized`. `materialized_reuse_token_rate` is the execution
-  plan's token-weighted form of the same metric. They answer different
-  questions — how many requests were served versus how much of the promised
-  mass arrived — and neither substitutes for the other. An advertise is a
-  promise and an allocation is a destination; only `runtime_materialized` is
-  evidence that KV was written.
-- **M7 `propagation_contamination_rate`** (the plan calls M7 "contamination /
-  propagation rate") — among `propagation_probe` rows, the fraction that
-  materialized nothing of their own yet still reported cached tokens: KV that
-  reached them through the exact prefix cache, which is where a previously
-  approximate request's blocks leak to.
+**Which rows count.** Every rate above is computed over the *auditable* rows
+only: an arm that ran a connector (never a `cold` row) and rows an audit was
+actually joined to (`audit_joined is not None`). `merge-results` writes both
+arms into one document, and computing M1/M2 over that list doubles every
+denominator with requests no connector ever saw — halving each rate for free.
+The two exclusion counters above say how many rows left, and why.
+
+#### M1 — boundary alignment
+
+Not one number. Section 4 of the phase-0 plan gives three, all conditioned on
+`boundary > 0` and all deduped by `request_id`:
+
+```text
+alignment_given_match        = |{semantic_span_load_advertised, boundary>0, token_count>0}|
+                             / |{semantic_lookup_hit, boundary>0}|
+
+alignment_given_opportunity  = same numerator
+                             / |{manifest items in same_doc_new_instruction ∪ revised_doc}|
+
+boundary_miss_breakdown      = boundary_missed events partitioned by reason:
+                               stored_donor_tokens == 0      -> donor_not_captured
+                               stored_donor_tokens < span    -> donor_too_short
+                               n_raw_segments > 0, snapped=0 -> below_min_semantic_span
+                               otherwise                     -> true_misalignment
+```
+
+The two rates differ only in what they condition on. `alignment_given_match`
+asks *when the provider found a donor, did the engine's boundary land on a
+span?* — a property of the tokenizer and the template, and null (never `1.0`)
+when the connector emits no `semantic_lookup_hit` events to divide by.
+`alignment_given_opportunity` asks *of the traffic that should have been
+reusable, how much was served?* — the product number, and therefore the
+headline; `boundary_alignment_rate` is its alias and nothing else.
+
+Two deliberate deviations, both to keep the numbers honest:
+
+- the opportunity rate counts its numerator over its own denominator's
+  population. Section 4 shares one numerator between the two rates, which
+  works only if every advertise comes from one of the two classes; it does not
+  (`rope_delta_sweep` items carry donors too), and a shared numerator over a
+  two-class denominator can exceed `1.0` and stop being a fraction.
+- a miss event carrying none of the partition's fields is `unclassified`
+  rather than `true_misalignment`. A pre-B9 connector's payload contains no
+  diagnosis, and publishing one from it would invent the finding.
+
+The integrity check beside them compares the live planner with the offline
+model: `expected_supplied_tokens_agreement_rate` over the rows that carried
+both an expectation and an advertise, and the same for
+`expected_span_target_start`. Divergence on the token count means the offline
+model and the live engine disagree about the planner — investigate.
+
+#### M2 — materialized reuse
+
+```text
+materialized_reuse_rate = Σ runtime_materialized.tokens
+                        / Σ semantic_span_load_advertised.token_count
+```
+
+That token-weighted ratio is the headline and is what `materialized_reuse_rate`
+carries (`materialized_reuse_token_rate` is an alias of the same number, kept
+for continuity). The request-count form — how many advertising requests got
+*any* of their promise — is a different question and has its own name,
+`materialized_reuse_request_rate`. The two disagree whenever the served
+requests are not the large ones, which is exactly when the difference matters.
+
+An advertise is a promise and an allocation is a destination; only
+`runtime_materialized` is evidence that KV was written.
+
+#### M7 — contamination / propagation (paired documents only)
+
+M7 is a **cross-arm answer comparison**, so it lives in the `paired` block and
+needs both arms:
+
+```text
+propagation_contamination_rate            + _numerator / _denominator
+propagation_definition                    what the comparison actually did
+propagation_probe_pairs                   probe items present in both arms
+propagation_probes_unlinked               no parent_item_id on the row
+propagation_probes_without_served_answer  parent absent, or answered nothing
+propagation_probes_without_answers        probe missing an answer in an arm
+```
+
+A propagation probe is a verbatim repeat of an earlier request that was served
+approximate KV, so three answers exist for one prompt: the **served** answer
+(the parent item's answer in the same arm), the **cold** answer (this item's
+own answer in the baseline arm, which is what an uncontaminated engine must
+return), and the treatment answer under test. A probe counts as propagated
+when its treatment answer is strictly closer (ROUGE-L) to the served answer
+than to the cold one — strictly, because a tie is not evidence.
+
+Read it beside `prefix_blocks_evicted`, which is the counter section 4 makes
+the gate on lane-2 quality: **until that counter reads non-zero on a
+contaminated workload, treat every lane-2 quality number as unproven,
+including a favourable one.**
+
+`propagation_cached_without_materialization_rate` — probes that materialized
+nothing of their own yet still reported cached tokens — is a per-row
+supporting signal in the per-arm block, not M7.
 
 Every rate is published beside its own numerator and denominator, so `0.0` over
 three requests is never read as `0.0` over three hundred. Every audit-derived
@@ -398,9 +533,15 @@ The `paired` result block is the TTFT source of truth; single-arm
 - `engine_ttft_speedup_median` (+`_ci`) — the engine-side companion, reported
   apart from the headline (see Engine-Side TTFT above).
 - `ttft_{cold,warm}_p{50,95}_ms` — per-arm percentiles.
-- `negative_control_ttft_speedup_median` / `negative_control_ttft_speedup_mean`
-  — must sit at ~1.0; deviation means the cache acted on unrelated content
-  (gate: `--max-negative-control-speedup-deviation`, which reads the mean).
+- `negative_control_ttft_speedup_median` (+`_ci`) — must sit at ~1.0;
+  deviation means the cache acted on unrelated content. This is what
+  `--max-negative-control-speedup-deviation` gates, and the gate reports the
+  CI beside the point estimate, for the same reason the headline gate reads a
+  median: one control pair whose cold arm hit a slow prefill moves a mean far
+  enough to fail a deviation gate on its own — reporting contamination that
+  did not happen, and by the same arithmetic hiding one that did.
+  `negative_control_ttft_speedup_mean` stays beside it as a secondary,
+  tail-sensitive figure and is not gateable.
 - `hit_rate_external_confirmed` — the strict hit rate: external-connector
   mass only, prefix-cache repeats excluded. `None`, never `0.0`, when no pair
   carried the external split; `pairs_external_confirmed` /

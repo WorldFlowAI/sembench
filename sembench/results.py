@@ -230,9 +230,34 @@ def reuse_mechanism(row: RequestMetrics) -> str:
     return "none"
 
 
-# The traffic class whose whole job is to detect propagation: a verbatim
-# repeat of a request that was previously served approximate KV.
+# The manifest's traffic classes (phase-0 plan §3). The results layer has to
+# know them by name because two of the metrics are defined over classes, not
+# over requests: M1's opportunity denominator and M7's probe set.
+NO_REUSE_CLASS = "no_reuse"
+SAME_DOC_NEW_INSTRUCTION_CLASS = "same_doc_new_instruction"
+REVISED_DOC_CLASS = "revised_doc"
+ROPE_DELTA_SWEEP_CLASS = "rope_delta_sweep"
+EXACT_REPEAT_CLASS = "exact_repeat"
+# The class whose whole job is to detect propagation: a verbatim repeat of a
+# request that was previously served approximate KV, >= 50 requests later.
 PROPAGATION_PROBE_CLASS = "propagation_probe"
+REWORDED_DOC_CLASS = "reworded_doc"
+TRAFFIC_CLASSES = (
+    NO_REUSE_CLASS,
+    SAME_DOC_NEW_INSTRUCTION_CLASS,
+    REVISED_DOC_CLASS,
+    ROPE_DELTA_SWEEP_CLASS,
+    EXACT_REPEAT_CLASS,
+    PROPAGATION_PROBE_CLASS,
+    REWORDED_DOC_CLASS,
+)
+
+# M1's alignment_given_opportunity denominator, from section 4 verbatim:
+# "|{manifest items in same_doc_new_instruction ∪ revised_doc}|". It is the
+# classes, not the offline model's per-item prediction: an item whose donor
+# should have been reusable and was not is exactly what the metric is for, so
+# it cannot be conditioned on the prediction that it would be.
+ALIGNMENT_OPPORTUNITY_CLASSES = (SAME_DOC_NEW_INSTRUCTION_CLASS, REVISED_DOC_CLASS)
 
 
 def traffic_class_of(row: RequestMetrics) -> str:
@@ -267,87 +292,262 @@ def _rate_or_none(numerator: int, denominator: int) -> float | None:
     return float(numerator) / float(denominator)
 
 
-def connector_audit_metrics(rows: list[RequestMetrics]) -> dict[str, Any]:
-    """M1 boundary alignment, M2 materialized reuse, M7 propagation.
+@dataclass(frozen=True)
+class AuditableRows:
+    """The rows an audit-derived metric may be computed over, and the rest.
 
-    All three are joined per request from the connector's audit stream (B10),
-    and all three publish their numerator and denominator beside the rate so a
-    0.0 over three requests is never read as a 0.0 over three hundred.
+    A row is auditable when the connector could have written events about it
+    *and* the audit was actually read for it. Two kinds of row cannot be:
 
-    M1 ``boundary_alignment_rate`` — among rows whose manifest says a
-    compatible donor existed (``expected_supplied_tokens > 0``), the fraction
-    whose observed boundary equals ``expected_span_target_start``. A row that
-    only ever produced a boundary-missed event stays in the denominator: the
-    miss is the thing being measured.
-
-    M2 ``materialized_reuse_rate`` — among rows carrying a
-    ``semantic_span_load_advertised``, the fraction that also carried a
-    ``runtime_materialized``. The token-weighted form beside it is §4's
-    ``Σ runtime_materialized.tokens / Σ advertised token_count``; they answer
-    different questions (how many requests were served vs how much of the
-    promised mass arrived) and neither substitutes for the other.
-
-    M7 ``propagation_contamination_rate`` — among ``propagation_probe`` rows,
-    the fraction with no materialization of their own
-    (``external_confirmed_tokens`` null) but non-zero ``cached_tokens``: KV
-    that reached them from the exact prefix cache, which is where a previously
-    approximate request's blocks leak to.
-
-    Denominators that only the audit can supply are null, not zero, when no
-    audit was joined; denominators the manifest supplies are reported either
-    way.
+    - a **cold-arm** row, which ran against a server with no connector at all.
+      A merged cold/warm document holds both arms in one list, and computing
+      M1/M2/M7 over that list doubles every denominator with requests no
+      connector ever saw — halving each rate for free.
+    - a row the audit was never joined to (``audit_joined is None``), which is
+      unmeasured rather than negative.
     """
-    joined = audit_was_joined(rows)
 
-    donor_expected = [row for row in rows if (row.expected_supplied_tokens or 0) > 0]
-    aligned = sum(
+    rows: tuple[RequestMetrics, ...]
+    excluded_cold_arm: int
+    excluded_not_joined: int
+
+
+def auditable_rows(rows: list[RequestMetrics]) -> AuditableRows:
+    """Split rows into the auditable ones and counts of what was excluded."""
+    from sembench.pairing import COLD_ARM
+
+    considered: list[RequestMetrics] = []
+    cold = 0
+    unjoined = 0
+    for row in rows:
+        if row.arm == COLD_ARM:
+            cold += 1
+            continue
+        if row.audit_joined is None:
+            unjoined += 1
+            continue
+        considered.append(row)
+    return AuditableRows(tuple(considered), cold, unjoined)
+
+
+def _m1_alignment(considered: list[RequestMetrics], *, joined: bool) -> dict[str, Any]:
+    """M1: the three alignment numbers, plus the offline-model integrity check.
+
+    Deduped by request id by construction: one row is one request, and the
+    audit fold already collapsed a re-queried request's repeated attempts.
+    """
+    advertised_at_boundary = [
+        row
+        for row in considered
+        if (row.audit_advertised_tokens or 0) > 0 and (row.audit_observed_boundary or 0) > 0
+    ]
+    lookup_hits = [
+        row
+        for row in considered
+        if row.audit_semantic_lookup_hit and (row.audit_lookup_hit_boundary or 0) > 0
+    ]
+    opportunity = [
+        row for row in considered if traffic_class_of(row) in ALIGNMENT_OPPORTUNITY_CLASSES
+    ]
+    aligned = len(advertised_at_boundary)
+    # One deliberate deviation. Section 4 shares ONE numerator between the two
+    # rates, which holds only if every advertise comes from an item in the
+    # opportunity classes -- and it does not, since rope_delta_sweep items
+    # carry donors and advertise too. A shared numerator over a two-class
+    # denominator can exceed 1.0 and stop being a fraction, so each rate is
+    # counted over its own denominator's population. The gap between the two
+    # numerators is itself the count of advertises won outside the two classes.
+    aligned_opportunity = sum(
         1
-        for row in donor_expected
-        if row.audit_observed_boundary is not None
-        and row.expected_span_target_start is not None
-        and row.audit_observed_boundary == row.expected_span_target_start
+        for row in advertised_at_boundary
+        if traffic_class_of(row) in ALIGNMENT_OPPORTUNITY_CLASSES
     )
+    miss_breakdown: dict[str, int] = {}
+    for row in considered:
+        if row.audit_boundary_miss_reason and (row.audit_boundary_missed_at or 0) > 0:
+            reason = row.audit_boundary_miss_reason
+            miss_breakdown[reason] = miss_breakdown.get(reason, 0) + 1
+    opportunity_rate = _rate_or_none(aligned_opportunity, len(opportunity)) if joined else None
+    return {
+        "alignment_given_match": _rate_or_none(aligned, len(lookup_hits)) if joined else None,
+        "alignment_given_match_numerator": aligned if joined else None,
+        "alignment_given_match_denominator": len(lookup_hits),
+        "alignment_given_opportunity": opportunity_rate,
+        "alignment_given_opportunity_numerator": aligned_opportunity if joined else None,
+        "alignment_given_opportunity_denominator": len(opportunity),
+        "boundary_miss_breakdown": dict(sorted(miss_breakdown.items())) if joined else None,
+        # The headline alias. The same number as alignment_given_opportunity,
+        # kept because it is the name every earlier result document used.
+        "boundary_alignment_rate": opportunity_rate,
+        **_m1_integrity_check(considered, joined=joined),
+    }
 
-    advertised = [row for row in rows if row.audit_advertised_tokens is not None]
+
+def _m1_integrity_check(considered: list[RequestMetrics], *, joined: bool) -> dict[str, Any]:
+    """Did the live planner do what the offline model predicted it would?
+
+    Section 4: divergence on the token count "means the offline model and the
+    live engine disagree about the planner -- investigate". Only rows carrying
+    both a manifest expectation and an advertise can be compared; the rest are
+    outside the denominator rather than counted as agreement.
+    """
+    supplied_claims = [
+        row
+        for row in considered
+        if row.expected_supplied_tokens is not None and row.audit_advertised_tokens is not None
+    ]
+    supplied_agreed = sum(
+        1 for row in supplied_claims if row.audit_advertised_tokens == row.expected_supplied_tokens
+    )
+    start_claims = [
+        row
+        for row in considered
+        if row.expected_span_target_start is not None
+        and row.audit_advertised_target_start is not None
+    ]
+    start_agreed = sum(
+        1
+        for row in start_claims
+        if row.audit_advertised_target_start == row.expected_span_target_start
+    )
+    return {
+        "expected_supplied_tokens_agreement_rate": (
+            _rate_or_none(supplied_agreed, len(supplied_claims)) if joined else None
+        ),
+        "expected_supplied_tokens_agreement_numerator": supplied_agreed if joined else None,
+        "expected_supplied_tokens_agreement_denominator": len(supplied_claims),
+        "expected_span_target_start_agreement_rate": (
+            _rate_or_none(start_agreed, len(start_claims)) if joined else None
+        ),
+        "expected_span_target_start_agreement_numerator": start_agreed if joined else None,
+        "expected_span_target_start_agreement_denominator": len(start_claims),
+    }
+
+
+def _m2_materialized_reuse(considered: list[RequestMetrics], *, joined: bool) -> dict[str, Any]:
+    """M2: the token-weighted headline, and the request-count rate beside it."""
+    advertised = [row for row in considered if row.audit_advertised_tokens is not None]
     materialized_rows = [row for row in advertised if row.audit_materialized]
     advertised_tokens = sum(row.audit_advertised_tokens or 0 for row in advertised)
     materialized_tokens = sum(row.external_confirmed_tokens or 0 for row in materialized_rows)
+    token_rate = _rate_or_none(materialized_tokens, advertised_tokens) if joined else None
+    return {
+        # Section 4's formula, and therefore the headline.
+        "materialized_reuse_rate": token_rate,
+        "materialized_reuse_tokens": materialized_tokens if joined else None,
+        "materialized_reuse_advertised_tokens": advertised_tokens if joined else None,
+        # Alias of the same token-weighted number, for continuity.
+        "materialized_reuse_token_rate": token_rate,
+        # The request-count question, under its own name.
+        "materialized_reuse_request_rate": (
+            _rate_or_none(len(materialized_rows), len(advertised)) if joined else None
+        ),
+        "materialized_reuse_request_numerator": len(materialized_rows) if joined else None,
+        "materialized_reuse_request_denominator": len(advertised),
+    }
 
-    probes = [row for row in rows if traffic_class_of(row) == PROPAGATION_PROBE_CLASS]
-    propagated = sum(
+
+def _m7_inputs(considered: list[RequestMetrics], *, joined: bool) -> dict[str, Any]:
+    """M7's per-arm inputs: the gating counter and one supporting signal.
+
+    Neither is M7 itself, which is the cross-arm answer comparison in
+    :func:`paired_summary`.
+    """
+    probes = [row for row in considered if traffic_class_of(row) == PROPAGATION_PROBE_CLASS]
+    cached_without_materialization = sum(
         1
         for row in probes
         if row.external_confirmed_tokens is None and (row.backend_confirmed_tokens or 0) > 0
     )
+    evicting_rows = [row for row in considered if row.audit_prefix_blocks_evicted is not None]
+    blocks_evicted = sum(row.audit_prefix_blocks_evicted or 0 for row in evicting_rows)
+    return {
+        "propagation_cached_without_materialization_rate": (
+            _rate_or_none(cached_without_materialization, len(probes)) if joined else None
+        ),
+        "propagation_cached_without_materialization_numerator": (
+            cached_without_materialization if joined else None
+        ),
+        "propagation_cached_without_materialization_denominator": len(probes),
+        "prefix_blocks_evicted": blocks_evicted if joined else None,
+        "rows_with_prefix_blocks_evicted": (
+            sum(1 for row in evicting_rows if (row.audit_prefix_blocks_evicted or 0) > 0)
+            if joined
+            else None
+        ),
+    }
 
+
+def connector_audit_metrics(rows: list[RequestMetrics]) -> dict[str, Any]:
+    """M1 boundary alignment and M2 materialized reuse, per section 4.
+
+    Every rate here is computed over :func:`auditable_rows` only — never over
+    a cold arm, never over a row the audit was not joined to — and every rate
+    publishes its own numerator and denominator, so a 0.0 over three requests
+    is never read as a 0.0 over three hundred.
+
+    **M1 — boundary alignment.** Section 4 gives three numbers, all
+    conditioned on ``boundary > 0`` and all deduped by ``request_id``::
+
+        alignment_given_match        = |{semantic_span_load_advertised, boundary>0, token_count>0}|
+                                     / |{semantic_lookup_hit, boundary>0}|
+
+        alignment_given_opportunity  = same numerator
+                                     / |{manifest items in same_doc_new_instruction ∪ revised_doc}|
+
+        boundary_miss_breakdown      = boundary_missed events partitioned by reason
+
+    The two rates differ in what they are conditioned on (and therefore, see
+    :func:`_m1_alignment`, in the population their shared numerator is counted
+    over): ``alignment_given_match`` asks "when the provider found a donor,
+    did the engine's boundary land on a span?", which is the property of the
+    *tokenizer and the template* that caveat A of the plan is about;
+    ``alignment_given_opportunity`` asks "of the traffic that should have been
+    reusable, how much was served?", which is the product number and therefore
+    the headline — ``boundary_alignment_rate`` is kept as its alias and
+    nothing else.
+
+    Beside them, M1's integrity check: does the connector's advertised
+    ``token_count`` match the offline model's ``expected_supplied_tokens``,
+    and its ``target_start`` the model's ``expected_span_target_start``?
+    Section 4: divergence on the token count "means the offline model and the
+    live engine disagree about the planner — investigate".
+
+    **M2 — materialized reuse.** Section 4, verbatim::
+
+        materialized_reuse_rate = Σ runtime_materialized.tokens
+                                / Σ semantic_span_load_advertised.token_count
+
+    That token-weighted ratio is what ``materialized_reuse_rate`` carries. The
+    request-count form ("how many requests got any of their promise") is a
+    different question and has a different name,
+    ``materialized_reuse_request_rate``; neither substitutes for the other.
+
+    **M7's inputs, not M7.** ``prefix_blocks_evicted`` is section 4's gating
+    counter: until it reads non-zero on a contaminated workload, every lane-2
+    quality number is unproven. ``propagation_cached_without_materialization_rate``
+    is a per-row supporting signal (probes with no materialization of their
+    own but non-zero ``cached_tokens``), NOT M7 — M7 is the cross-arm answer
+    comparison in :func:`paired_summary`, which needs both arms.
+    """
+    auditable = auditable_rows(rows)
+    considered = list(auditable.rows)
+    # "Was an audit joined to any row these metrics could be computed over" --
+    # not "to any row at all". A cold row the join happened to stamp says
+    # nothing about the arm that ran the connector.
+    joined = audit_was_joined(considered)
     return {
         "connector_audit_present": joined,
         "connector_audit_rows_joined": (
-            sum(1 for row in rows if row.audit_joined) if joined else None
+            sum(1 for row in considered if row.audit_joined) if joined else None
         ),
-        # M1
-        "boundary_alignment_rate": (
-            _rate_or_none(aligned, len(donor_expected)) if joined else None
-        ),
-        "boundary_alignment_numerator": aligned if joined else None,
-        "boundary_alignment_denominator": len(donor_expected),
-        # M2
-        "materialized_reuse_rate": (
-            _rate_or_none(len(materialized_rows), len(advertised)) if joined else None
-        ),
-        "materialized_reuse_numerator": len(materialized_rows) if joined else None,
-        "materialized_reuse_denominator": len(advertised) if joined else None,
-        "materialized_reuse_token_rate": (
-            _rate_or_none(materialized_tokens, advertised_tokens) if joined else None
-        ),
-        "materialized_reuse_tokens": materialized_tokens if joined else None,
-        "materialized_reuse_advertised_tokens": advertised_tokens if joined else None,
-        # M7
-        "propagation_contamination_rate": (
-            _rate_or_none(propagated, len(probes)) if joined else None
-        ),
-        "propagation_contamination_numerator": propagated if joined else None,
-        "propagation_contamination_denominator": len(probes),
+        # What the metrics below were, and were not, computed over.
+        "connector_audit_rows_considered": len(considered),
+        "connector_audit_rows_excluded_cold_arm": auditable.excluded_cold_arm,
+        "connector_audit_rows_excluded_not_joined": auditable.excluded_not_joined,
+        **_m1_alignment(considered, joined=joined),
+        **_m2_materialized_reuse(considered, joined=joined),
+        **_m7_inputs(considered, joined=joined),
     }
 
 
@@ -477,6 +677,76 @@ def _kl_summary(pairs: list[_Pair]) -> dict[str, Any]:
     }
 
 
+def _propagation_summary(
+    pairs: list[_Pair],
+    warm_by_item: dict[str, RequestMetrics],
+) -> dict[str, Any]:
+    """M7 — contamination / propagation, as section 4 defines it.
+
+    Section 4::
+
+        A4 vs A6 on the 50 propagation_probe items: fraction whose answer in
+        A6 matches the *served* output rather than the *cold* (A1) output.
+
+    A propagation probe is a verbatim repeat of an earlier request that was
+    served approximate KV (§3), so three answers exist for one prompt and the
+    question is which of two the treatment arm reproduces:
+
+    - the **served** answer — the parent item's answer in the *same* arm, i.e.
+      the output produced while approximate KV was in play;
+    - the **cold** answer — this item's own answer in the baseline arm, which
+      is what an uncontaminated engine must return for a verbatim repeat.
+
+    A probe counts as propagated when its treatment answer is strictly closer
+    (ROUGE-L) to the served answer than to the cold one. Strictly: a tie is
+    not evidence, and contamination is a claim that has to be earned.
+
+    Every probe that cannot be scored is counted and named rather than
+    dropped — an unlinked probe, a parent with no answer in this arm, a probe
+    missing either answer — because M7's denominator is 50 items by design and
+    a silently shrunken one reads as a clean result.
+    """
+    from sembench.quality import rouge_l
+
+    probes = [pair for pair in pairs if traffic_class_of(pair.warm) == PROPAGATION_PROBE_CLASS]
+    scored = 0
+    propagated = 0
+    unlinked = 0
+    without_served_answer = 0
+    without_answers = 0
+    for pair in probes:
+        parent_id = pair.warm.propagation_parent_item_id or pair.cold.propagation_parent_item_id
+        if not parent_id:
+            unlinked += 1
+            continue
+        served = warm_by_item.get(parent_id)
+        if served is None or not served.output_text:
+            without_served_answer += 1
+            continue
+        if not pair.warm.output_text or not pair.cold.output_text:
+            without_answers += 1
+            continue
+        scored += 1
+        to_served = rouge_l(pair.warm.output_text, served.output_text)
+        to_cold = rouge_l(pair.warm.output_text, pair.cold.output_text)
+        if to_served > to_cold:
+            propagated += 1
+    return {
+        "propagation_definition": (
+            "share of propagation_probe items whose treatment-arm answer is closer to the "
+            "parent item's answer in the same arm (the served output) than to its own "
+            "answer in the baseline arm (the cold output)"
+        ),
+        "propagation_contamination_rate": _rate_or_none(propagated, scored),
+        "propagation_contamination_numerator": propagated,
+        "propagation_contamination_denominator": scored,
+        "propagation_probe_pairs": len(probes),
+        "propagation_probes_unlinked": unlinked,
+        "propagation_probes_without_served_answer": without_served_answer,
+        "propagation_probes_without_answers": without_answers,
+    }
+
+
 def _engine_ttft_summary(pairs: list[_Pair]) -> dict[str, Any]:
     """Speedup from the engine-side TTFT that excludes queue wait.
 
@@ -529,6 +799,10 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
     A "hit" is semantic reuse only (see :func:`semantic_reuse_tokens`); a
     local prefix-cache repeat lands in the 'exact' mechanism bucket and in
     ``hits_unverified_external``, never in ``hit_rate_external_confirmed``.
+
+    This block is also where M7 lives (:func:`_propagation_summary`): it is a
+    comparison between the two arms' answers and cannot be computed from one
+    arm's rows, which is why the per-arm audit metrics carry only its inputs.
     """
     cold = {r.item_id: r for r in requests if r.arm == "cold"}
     warm = {r.item_id: r for r in requests if r.arm == "warm"}
@@ -628,8 +902,12 @@ def paired_summary(requests: list[RequestMetrics]) -> dict[str, Any] | None:
         "warm_vs_cold_output_rouge_l_mean": rouge_ci.point if rouge_ci else None,
         "warm_vs_cold_output_rouge_l_ci": rouge_ci.to_dict() if rouge_ci else None,
         # Audit-joined metrics are the warm (connector) arm's: the cold arm
-        # runs without a connector and has no audit stream to join.
+        # runs without a connector and has no audit stream to join, and
+        # connector_audit_metrics drops any cold row it is handed anyway.
         **connector_audit_metrics(warm_rows),
+        # M7 needs both arms and the warm arm's other rows: see
+        # _propagation_summary.
+        **_propagation_summary(pairs, warm),
         **_kl_summary(pairs),
         **_engine_ttft_summary(pairs),
         # Back-compat alias for the pre-P3 field name.

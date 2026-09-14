@@ -465,40 +465,60 @@ def test_an_unjoined_row_stays_unmeasured_rather_than_a_miss(audit_path):
     assert is_reuse_hit(silent) is None
 
 
-def test_boundary_alignment_counts_only_rows_a_donor_existed_for(audit_path):
+def test_alignment_given_opportunity_is_over_the_two_manifest_classes(audit_path):
     rows, _ = _joined(audit_path)
     metrics = connector_audit_metrics(list(rows.values()))
 
-    # i1 (1024) and i3 (1024 after the re-advertise) land on the expected
-    # target_start; i2 stopped at 1008 and i4 was never advertised at all.
-    # i5/p1/p2 declare no donor and are outside the denominator.
-    assert metrics["boundary_alignment_denominator"] == 4
-    assert metrics["boundary_alignment_numerator"] == 2
-    assert metrics["boundary_alignment_rate"] == 0.5
+    # Opportunity classes are same_doc_new_instruction (i1, i2) and
+    # revised_doc (i3, i4). Of those, i1 and i3 advertised a non-zero span at
+    # a non-zero boundary; i2 missed at 1008 and i4 was never advertised at
+    # all. i5 (no_reuse) and the two probes are outside the denominator.
+    assert metrics["alignment_given_opportunity_denominator"] == 4
+    assert metrics["alignment_given_opportunity_numerator"] == 2
+    assert metrics["alignment_given_opportunity"] == 0.5
+    # The documented headline alias is the same number and nothing else.
+    assert metrics["boundary_alignment_rate"] == metrics["alignment_given_opportunity"]
 
 
-def test_materialized_reuse_is_over_advertised_requests_only(audit_path):
+def test_alignment_given_match_is_null_without_lookup_hit_events(audit_path):
+    """Its denominator is |{semantic_lookup_hit, boundary>0}|, so a connector
+    that does not emit that event leaves the rate unmeasurable — null, never
+    a flattering 1.0 over the advertises it did emit."""
     rows, _ = _joined(audit_path)
     metrics = connector_audit_metrics(list(rows.values()))
 
-    # Advertised: i1, i3, p2. Materialized: i1, p2.
-    assert metrics["materialized_reuse_denominator"] == 3
-    assert metrics["materialized_reuse_numerator"] == 2
-    assert metrics["materialized_reuse_rate"] == pytest.approx(2 / 3)
+    assert metrics["alignment_given_match_denominator"] == 0
+    assert metrics["alignment_given_match"] is None
+    # The numerator is still counted, over every audited class: i1, i3, p2.
+    assert metrics["alignment_given_match_numerator"] == 3
+
+
+def test_materialized_reuse_headline_is_token_weighted(audit_path):
+    rows, _ = _joined(audit_path)
+    metrics = connector_audit_metrics(list(rows.values()))
+
+    # Advertised: i1 (512), i3 (768), p2 (512). Materialized: i1 + p2 = 1024.
     assert metrics["materialized_reuse_advertised_tokens"] == 512 + 768 + 512
     assert metrics["materialized_reuse_tokens"] == 1024
-    assert metrics["materialized_reuse_token_rate"] == pytest.approx(1024 / 1792)
+    assert metrics["materialized_reuse_rate"] == pytest.approx(1024 / 1792)
+    assert metrics["materialized_reuse_token_rate"] == metrics["materialized_reuse_rate"]
+    # The request-count question keeps its own name.
+    assert metrics["materialized_reuse_request_denominator"] == 3
+    assert metrics["materialized_reuse_request_numerator"] == 2
+    assert metrics["materialized_reuse_request_rate"] == pytest.approx(2 / 3)
 
 
-def test_propagation_counts_probes_warmed_without_a_materialization(audit_path):
+def test_probes_cached_without_a_materialization_are_a_supporting_signal(audit_path):
     rows, _ = _joined(audit_path)
     metrics = connector_audit_metrics(list(rows.values()))
 
     # p1 materialized nothing of its own but was served 2048 cached tokens;
-    # p2 got its own semantic load and is not propagation.
-    assert metrics["propagation_contamination_denominator"] == 2
-    assert metrics["propagation_contamination_numerator"] == 1
-    assert metrics["propagation_contamination_rate"] == 0.5
+    # p2 got its own semantic load and is not propagation. This is NOT M7 —
+    # M7 is the cross-arm answer comparison in paired_summary.
+    assert metrics["propagation_cached_without_materialization_denominator"] == 2
+    assert metrics["propagation_cached_without_materialization_numerator"] == 1
+    assert metrics["propagation_cached_without_materialization_rate"] == 0.5
+    assert "propagation_contamination_rate" not in metrics
 
 
 def test_a_probe_class_declared_on_transform_is_still_a_probe(audit_path):
@@ -507,8 +527,20 @@ def test_a_probe_class_declared_on_transform_is_still_a_probe(audit_path):
 
     metrics = connector_audit_metrics([legacy])
 
-    assert metrics["propagation_contamination_denominator"] == 1
-    assert metrics["propagation_contamination_numerator"] == 1
+    assert metrics["propagation_cached_without_materialization_denominator"] == 1
+    assert metrics["propagation_cached_without_materialization_numerator"] == 1
+
+
+def test_the_eviction_counter_reaches_the_row_and_the_metrics(audit_path):
+    """Section 4 gates every lane-2 quality number on this counter reading
+    non-zero, so it has to leave the audit stream."""
+    rows, _ = _joined(audit_path)
+    metrics = connector_audit_metrics(list(rows.values()))
+
+    assert rows["i1"].audit_prefix_blocks_evicted == 32
+    assert rows["i2"].audit_prefix_blocks_evicted == 0
+    assert metrics["prefix_blocks_evicted"] == 32
+    assert metrics["rows_with_prefix_blocks_evicted"] == 1
 
 
 def test_an_absent_audit_yields_nulls_not_zeros():
@@ -522,20 +554,27 @@ def test_an_absent_audit_yields_nulls_not_zeros():
     assert metrics["connector_audit_rows_joined"] is None
     for key in (
         "boundary_alignment_rate",
-        "boundary_alignment_numerator",
+        "alignment_given_match",
+        "alignment_given_match_numerator",
+        "alignment_given_opportunity",
+        "alignment_given_opportunity_numerator",
+        "boundary_miss_breakdown",
         "materialized_reuse_rate",
-        "materialized_reuse_numerator",
-        "materialized_reuse_denominator",
         "materialized_reuse_token_rate",
         "materialized_reuse_tokens",
         "materialized_reuse_advertised_tokens",
-        "propagation_contamination_rate",
-        "propagation_contamination_numerator",
+        "materialized_reuse_request_rate",
+        "materialized_reuse_request_numerator",
+        "propagation_cached_without_materialization_rate",
+        "propagation_cached_without_materialization_numerator",
+        "prefix_blocks_evicted",
     ):
         assert metrics[key] is None, key
-    # Denominators the manifest supplies are still counted.
-    assert metrics["boundary_alignment_denominator"] == 4
-    assert metrics["propagation_contamination_denominator"] == 2
+    # No row could have been audited, and the counters say exactly that
+    # rather than leaving a denominator to be read as a measured zero.
+    assert metrics["connector_audit_rows_considered"] == 0
+    assert metrics["connector_audit_rows_excluded_not_joined"] == 7
+    assert metrics["alignment_given_opportunity_denominator"] == 0
 
 
 def test_rates_are_null_rather_than_zero_over_an_empty_denominator(audit_path):
@@ -545,11 +584,12 @@ def test_rates_are_null_rather_than_zero_over_an_empty_denominator(audit_path):
     metrics = connector_audit_metrics(rows)
 
     assert metrics["connector_audit_present"] is True
-    assert metrics["boundary_alignment_denominator"] == 0
+    assert metrics["alignment_given_opportunity_denominator"] == 0
+    assert metrics["alignment_given_opportunity"] is None
     assert metrics["boundary_alignment_rate"] is None
-    assert metrics["materialized_reuse_denominator"] == 0
+    assert metrics["materialized_reuse_request_denominator"] == 0
     assert metrics["materialized_reuse_rate"] is None
-    assert metrics["propagation_contamination_rate"] is None
+    assert metrics["propagation_cached_without_materialization_rate"] is None
 
 
 def test_the_aggregate_and_paired_summary_both_publish_the_three_rates(audit_path):
@@ -575,9 +615,27 @@ def test_the_aggregate_and_paired_summary_both_publish_the_three_rates(audit_pat
     assert aggregate["connector_audit_rows_joined"] == 5
     # The paired block reports the warm (connector) arm's audit metrics.
     assert paired["boundary_alignment_rate"] == 0.5
-    assert paired["materialized_reuse_numerator"] == 2
-    assert paired["propagation_contamination_denominator"] == 2
+    assert paired["materialized_reuse_request_numerator"] == 2
+    assert paired["propagation_cached_without_materialization_denominator"] == 2
     assert paired["connector_audit_present"] is True
+
+
+def test_a_merged_documents_cold_arm_is_not_in_the_audit_denominators(audit_path):
+    """merge-results holds both arms in one list. Computing M1/M2 over that
+    list doubles every denominator with requests no connector ever saw."""
+    warm, _ = join_audit_file(_warm_rows(), audit_path)
+    cold = [replace(row, arm="cold", audit_joined=None) for row in warm]
+
+    both_arms = aggregate_metrics(cold + warm)
+    warm_only = aggregate_metrics(warm)
+
+    assert both_arms["connector_audit_rows_excluded_cold_arm"] == 7
+    assert (
+        both_arms["alignment_given_opportunity_denominator"]
+        == warm_only["alignment_given_opportunity_denominator"]
+        == 4
+    )
+    assert both_arms["boundary_alignment_rate"] == warm_only["boundary_alignment_rate"] == 0.5
 
 
 def test_the_negative_control_gate_can_read_a_median(audit_path):
