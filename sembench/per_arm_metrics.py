@@ -322,6 +322,10 @@ def _m1_alignment(
     many of the advertises came from outside the denominator's population, and
     a rate above 1.0 is read against it.
 
+    ``alignment_given_opportunity_in_class`` publishes the single-population
+    rate directly, since deriving it by subtraction is a step a reader skips:
+    stream B reported a blended 14/450 whose in-class value is 5/450.
+
     Section 4 also forbids publishing the blended rate alone: "Do not report a
     single blended alignment number. Report it separately for the
     shared-wrapper stratum and the ad-hoc stratum." That split is
@@ -363,6 +367,19 @@ def _m1_alignment(
         "alignment_given_opportunity_numerator": aligned if joined else None,
         "alignment_given_opportunity_numerator_outside_classes": (
             outside_classes if joined else None
+        ),
+        # The same rate over ONE population, published rather than left as a
+        # subtraction. Both halves are already here, so a reader who wants
+        # "of the items that carried a donor, how many aligned" can only get
+        # it by doing arithmetic on two fields -- and a reader in a hurry
+        # reads the blended rate as if it were this one. Measured on stream B:
+        # blended 14/450, in-class 5/450, because 9 of the 14 advertises came
+        # from incidental reuse in classes the denominator does not count.
+        "alignment_given_opportunity_in_class": (
+            _rate_or_none(aligned - outside_classes, denominator) if joined else None
+        ),
+        "alignment_given_opportunity_numerator_in_class": (
+            aligned - outside_classes if joined else None
         ),
         "alignment_given_opportunity_denominator": denominator,
         "alignment_given_opportunity_denominator_source": denominator_source,

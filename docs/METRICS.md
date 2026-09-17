@@ -419,6 +419,9 @@ alignment_given_match                     M1  + _numerator / _denominator
 alignment_given_opportunity               M1  + _numerator / _denominator
 alignment_given_opportunity_numerator_outside_classes
                                           advertises won outside the two classes
+alignment_given_opportunity_in_class      the same rate over ONE population
+alignment_given_opportunity_numerator_in_class
+                                          advertises won inside the two classes
 alignment_given_opportunity_denominator_source
                                           "manifest" or "rows_present"
 alignment_given_opportunity_rows_present  same numerator over the rows held
@@ -511,6 +514,17 @@ so the excess is named instead —
 `alignment_given_opportunity_numerator_outside_classes` is exactly how many of
 the advertises came from outside the denominator's population, and a rate above
 one is read against it.
+
+**`alignment_given_opportunity_in_class` is the same rate over one
+population**, published rather than left as a subtraction. Both halves were
+already here, but getting "of the items that carried a donor, how many
+aligned" required arithmetic on two fields, and a reader in a hurry takes the
+blended rate for that number. Stream B is the worked example: a blended
+`14/450` whose in-class value is `5/450`, because nine of the fourteen
+advertises were incidental reuse in classes the denominator does not count.
+Quote the blended rate when the question is "how much did the layer deliver";
+quote the in-class rate when the question is "how often did it fire on traffic
+built to let it".
 
 `boundary_miss_breakdown`'s second line is read off the payload the connector
 writes, not off the arithmetic above it. **A `stored_donor_tokens < span` test

@@ -819,6 +819,40 @@ def test_the_two_alignment_rates_share_one_numerator():
     # reason is published rather than hidden by trimming the numerator.
     assert metrics["alignment_given_opportunity"] == 1.5
     assert metrics["alignment_given_opportunity"] > 1.0
+    # The same rows over ONE population, so the reader is not left subtracting:
+    # 1 of the 3 advertises was in-class, against a 2-item denominator.
+    assert metrics["alignment_given_opportunity_numerator_in_class"] == 1
+    assert metrics["alignment_given_opportunity_in_class"] == 0.5
+
+
+def test_the_in_class_rate_is_not_the_blended_rate():
+    """Stream B in miniature: incidental reuse inflates the blended rate.
+
+    Two of the three advertises come from classes the denominator does not
+    count, so the blended rate is three times the in-class one. Reading the
+    blended number as "how often an item that carried a donor aligned" is the
+    mistake this field exists to prevent.
+    """
+    rows = [
+        _row("in-class", audit_advertised_tokens=3776, audit_observed_boundary=1024),
+        _row(
+            "no-reuse-a",
+            traffic_class="no_reuse",
+            audit_advertised_tokens=2048,
+            audit_observed_boundary=512,
+        ),
+        _row(
+            "no-reuse-b",
+            traffic_class="no_reuse",
+            audit_advertised_tokens=1024,
+            audit_observed_boundary=512,
+        ),
+    ]
+
+    metrics = connector_audit_metrics(rows, manifest_class_counts={SAME_DOC: 6})
+
+    assert metrics["alignment_given_opportunity"] == 0.5
+    assert metrics["alignment_given_opportunity_in_class"] == pytest.approx(1 / 6)
 
 
 def test_the_outside_class_count_is_zero_when_every_advertise_was_in_class():
@@ -828,6 +862,8 @@ def test_the_outside_class_count_is_zero_when_every_advertise_was_in_class():
 
     assert metrics["alignment_given_opportunity_numerator_outside_classes"] == 0
     assert metrics["alignment_given_opportunity"] == 0.5
+    # Nothing outside the classes, so the two rates agree.
+    assert metrics["alignment_given_opportunity_in_class"] == 0.5
 
 
 def test_the_opportunity_classes_are_the_two_section_four_names():
