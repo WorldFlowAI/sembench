@@ -431,6 +431,7 @@ def _donor_request(
     config: LiveGatewayConfig,
     base_url: str,
 ) -> dict[str, Any]:
+    system = _system_turn_for_item(item)
     return _chat_completion(
         base_url=base_url,
         model=config.model,
@@ -439,6 +440,9 @@ def _donor_request(
         tenant=_tenant_for_item(item, config),
         template=_template_for_item(item, config),
         timeout_seconds=config.timeout_seconds,
+        # Passed only when the row asks for one, so a row without a system
+        # turn makes the call every existing test double was written against.
+        **({} if system is None else {"system": system}),
     )
 
 
@@ -449,6 +453,7 @@ def _recipient_request(
     base_url: str,
     metrics_chunk: MetricsChunkCapture | None = None,
 ) -> dict[str, Any]:
+    system = _system_turn_for_item(item)
     return _chat_completion(
         base_url=base_url,
         model=config.model,
@@ -457,10 +462,11 @@ def _recipient_request(
         tenant=_tenant_for_item(item, config),
         template=_template_for_item(item, config),
         timeout_seconds=config.timeout_seconds,
-        # Passed only when the run asked for a capture, so with the flag off
-        # the call this runner makes is the call it has always made -- which is
-        # what every test double of `_chat_completion` is written against.
+        # Both passed only when present, so with neither the call this runner
+        # makes is the call it has always made -- which is what every test
+        # double of `_chat_completion` is written against.
         **({} if metrics_chunk is None else {"metrics_chunk": metrics_chunk}),
+        **({} if system is None else {"system": system}),
     )
 
 
@@ -604,6 +610,27 @@ def _first_header(headers: dict[str, str], names: Sequence[str]) -> str | None:
     return None
 
 
+def _system_turn_for_item(item: WorkloadItem) -> str | None:
+    """The system turn a manifest row asks for, or None.
+
+    The builder places the instruction wrapper in ``metadata.system_prompt``
+    and records every expectation on the row -- prompt_tokens, the boundary,
+    the span -- against ``messages=[system, user]``. Until 0.2.1 this runner
+    sent the user turn alone and read no system field, so the wrapper never
+    reached the engine: all eight wrappers of stream B tokenized to one
+    16-token prefix, the two halves of every "same document, new instruction"
+    pair were byte-identical on the wire, and the boundary sat at 16 on every
+    GPU tried. The manifest sidecar had recorded exactly this under
+    ``harness_message_shape.directive`` before the runs were made.
+
+    A row whose builder folded the wrapper into the user turn
+    (``system_in_user``) carries None here and must get nothing extra, or the
+    wrapper is sent twice.
+    """
+    value = item.metadata.get("system_prompt")
+    return value if isinstance(value, str) and value else None
+
+
 def _chat_completion(
     *,
     base_url: str,
@@ -614,14 +641,19 @@ def _chat_completion(
     template: str,
     timeout_seconds: float,
     metrics_chunk: MetricsChunkCapture | None = None,
+    system: str | None = None,
 ) -> dict[str, Any]:
     # Set by the runner for the request being issued on this thread. Sent as a
     # header (which vLLM prefers) and as a body field (which survives a front
     # end that strips unknown headers) -- see sembench.request_ids.
     request_id = current_request_id()
+    messages: list[dict[str, str]] = []
+    if system:
+        messages.append({"role": "system", "content": system})
+    messages.append({"role": "user", "content": prompt})
     payload: dict[str, Any] = {
         "model": model,
-        "messages": [{"role": "user", "content": prompt}],
+        "messages": messages,
         "temperature": 0,
         "max_tokens": max_tokens,
         "stream": True,
