@@ -280,12 +280,13 @@ def build_parser() -> argparse.ArgumentParser:
         action="append",
         default=[],
         metavar="URL",
-        help="Fleet worker endpoint donors are seeded on directly; repeat per worker (or "
-        "pass a comma-separated list). Recipients still go through --gateway-url, so what "
-        "is measured is the router's placement decision",
+        help="Fleet worker endpoint donors are seeded on directly (repeatable or comma-"
+        "separated); recipients still go through --gateway-url, so placement is measured",
     )
     gateway.add_argument("--tenant", default="tenant-a")
     gateway.add_argument("--template", default="rag-template-v1")
+    # Oracle: the harness knows the roles, so this bounds capture_policy=hinted.
+    gateway.add_argument("--capture-hint-role", default=None, help="hint capture on this role")
     gateway.add_argument("--block-size", type=int, default=16)
     gateway.add_argument("--tokenizer", default=None)
     gateway.add_argument("--max-items", type=int, default=None)
@@ -296,16 +297,14 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--post-donor-delay-ms", type=int, default=0)
     gateway.add_argument(
         "--concurrency",
-        type=int,
-        default=1,
+        type=int, default=1,
         help="Request streams in flight at once (default 1 = serial, unchanged). "
         "Above 1 the run also writes a throughput document; TTFT stays per-request, "
         "measured at the streamed first token",
     )
     gateway.add_argument(
         "--min-donor-gap-requests",
-        type=int,
-        default=0,
+        type=int, default=0,
         help="Minimum donor->recipient separation in COMPLETED requests, for manifests "
         "that name their donor in metadata.donor_item_id. Under concurrency a gap "
         "measured in stream positions does not hold",
@@ -547,6 +546,7 @@ def cmd_run_live_gateway(args) -> None:
         worker_urls=parse_worker_urls(args.worker_url),
         tenant=args.tenant,
         template=args.template,
+        capture_hint_role=args.capture_hint_role,
         block_size=args.block_size,
         tokenizer=args.tokenizer,
         max_items=args.max_items,

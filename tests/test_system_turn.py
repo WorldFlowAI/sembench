@@ -134,3 +134,44 @@ def test_a_row_without_a_system_prompt_makes_the_call_it_always_made(monkeypatch
     gateway_live._recipient_request(item=_item(), config=config, base_url=GATEWAY)
 
     assert "system" not in seen
+
+
+# --- the capture hint --------------------------------------------------------
+
+
+def test_a_hinted_role_carries_the_capture_flag_in_the_body(monkeypatch):
+    payload = _sent_payload(monkeypatch, extra_body={"vllm_xargs": {"semblend_capture": "1"}})
+    assert payload["vllm_xargs"] == {"semblend_capture": "1"}
+    assert payload["messages"] == [{"role": "user", "content": "the document"}]
+
+
+def test_the_hint_is_only_built_for_the_configured_role():
+    config = _config()
+    assert gateway_live._capture_hint_for_item(_item(role="seed"), config) is None  # unset
+    hinted = gateway_live.LiveGatewayConfig(
+        manifest=Path("m.jsonl"), output=Path("o.json"), gateway_url=GATEWAY, model="qwen",
+        recipient_max_tokens=8, donor_max_tokens=8, capture_hint_role="seed",
+    )
+    assert gateway_live._capture_hint_for_item(_item(role="seed"), hinted) == {
+        "vllm_xargs": {"semblend_capture": "1"}
+    }
+    assert gateway_live._capture_hint_for_item(_item(role="recipient"), hinted) is None
+    assert gateway_live._capture_hint_for_item(_item(), hinted) is None
+
+
+def test_an_unhinted_row_makes_the_call_it_always_made(monkeypatch):
+    seen: dict = {}
+
+    def fake_chat_completion(**kwargs):
+        seen.update(kwargs)
+        return {}
+
+    monkeypatch.setattr(gateway_live, "_chat_completion", fake_chat_completion)
+    hinted = gateway_live.LiveGatewayConfig(
+        manifest=Path("m.jsonl"), output=Path("o.json"), gateway_url=GATEWAY, model="qwen",
+        recipient_max_tokens=8, donor_max_tokens=8, capture_hint_role="seed",
+    )
+    gateway_live._recipient_request(item=_item(role="recipient"), config=hinted, base_url=GATEWAY)
+    assert "extra_body" not in seen
+    gateway_live._recipient_request(item=_item(role="seed"), config=hinted, base_url=GATEWAY)
+    assert seen["extra_body"] == {"vllm_xargs": {"semblend_capture": "1"}}

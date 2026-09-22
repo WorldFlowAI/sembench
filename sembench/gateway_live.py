@@ -94,6 +94,13 @@ class LiveGatewayConfig:
     worker_urls: tuple[str, ...] = ()
     tenant: str = "tenant-a"
     template: str = "rag-template-v1"
+    # When set, rows whose metadata.role equals this value are sent with
+    # vllm_xargs.semblend_capture=1, which a connector running
+    # capture_policy=hinted reads as "capture this one". The harness knows the
+    # roles from the manifest, so hinting by role is an ORACLE: it marks the
+    # rows the stream will re-read later. A run made this way measures the
+    # ceiling of selective capture, not what a router could do at first sight.
+    capture_hint_role: str | None = None
     block_size: int = 16
     tokenizer: str | None = None
     max_items: int | None = None
@@ -432,6 +439,7 @@ def _donor_request(
     base_url: str,
 ) -> dict[str, Any]:
     system = _system_turn_for_item(item)
+    hint = _capture_hint_for_item(item, config)
     return _chat_completion(
         base_url=base_url,
         model=config.model,
@@ -443,6 +451,7 @@ def _donor_request(
         # Passed only when the row asks for one, so a row without a system
         # turn makes the call every existing test double was written against.
         **({} if system is None else {"system": system}),
+        **({} if hint is None else {"extra_body": hint}),
     )
 
 
@@ -454,6 +463,7 @@ def _recipient_request(
     metrics_chunk: MetricsChunkCapture | None = None,
 ) -> dict[str, Any]:
     system = _system_turn_for_item(item)
+    hint = _capture_hint_for_item(item, config)
     return _chat_completion(
         base_url=base_url,
         model=config.model,
@@ -467,6 +477,7 @@ def _recipient_request(
         # double of `_chat_completion` is written against.
         **({} if metrics_chunk is None else {"metrics_chunk": metrics_chunk}),
         **({} if system is None else {"system": system}),
+        **({} if hint is None else {"extra_body": hint}),
     )
 
 
@@ -631,6 +642,17 @@ def _system_turn_for_item(item: WorkloadItem) -> str | None:
     return value if isinstance(value, str) and value else None
 
 
+CAPTURE_HINT_KEY = "semblend_capture"
+
+
+def _capture_hint_for_item(item: WorkloadItem, config: LiveGatewayConfig) -> dict[str, Any] | None:
+    """The extra body a hinted row carries, or None for an unhinted one."""
+    role = config.capture_hint_role
+    if not role or item.metadata.get("role") != role:
+        return None
+    return {"vllm_xargs": {CAPTURE_HINT_KEY: "1"}}
+
+
 def _chat_completion(
     *,
     base_url: str,
@@ -642,6 +664,7 @@ def _chat_completion(
     timeout_seconds: float,
     metrics_chunk: MetricsChunkCapture | None = None,
     system: str | None = None,
+    extra_body: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     # Set by the runner for the request being issued on this thread. Sent as a
     # header (which vLLM prefers) and as a body field (which survives a front
@@ -661,6 +684,8 @@ def _chat_completion(
         # only when usage reporting is on, so this is not optional.
         "stream_options": {"include_usage": True},
     }
+    if extra_body:
+        payload.update(extra_body)
     request_headers = {
         "Content-Type": "application/json",
         "x-tenant-id": tenant,
