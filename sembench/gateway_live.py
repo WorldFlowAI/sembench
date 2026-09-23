@@ -101,6 +101,11 @@ class LiveGatewayConfig:
     # rows the stream will re-read later. A run made this way measures the
     # ceiling of selective capture, not what a router could do at first sight.
     capture_hint_role: str | None = None
+    # Replay each row's metadata.staged_prefill plan: send every cut as a
+    # token-id prefix (max_tokens=1, vllm_xargs.semblend_stage=1) before the
+    # full prompt, which then also goes as token ids. TTFT counts from the
+    # first stage. The plan is the builder's, from the row's linked donor.
+    staged_prefill: bool = False
     block_size: int = 16
     tokenizer: str | None = None
     max_items: int | None = None
@@ -462,6 +467,11 @@ def _recipient_request(
     base_url: str,
     metrics_chunk: MetricsChunkCapture | None = None,
 ) -> dict[str, Any]:
+    plan = _stage_plan_for_item(item, config)
+    if plan is not None:
+        return _staged_recipient_request(
+            item=item, config=config, base_url=base_url, plan=plan, metrics_chunk=metrics_chunk
+        )
     system = _system_turn_for_item(item)
     hint = _capture_hint_for_item(item, config)
     return _chat_completion(
@@ -653,6 +663,120 @@ def _capture_hint_for_item(item: WorkloadItem, config: LiveGatewayConfig) -> dic
     return {"vllm_xargs": {CAPTURE_HINT_KEY: "1"}}
 
 
+STAGE_HINT_KEY = "semblend_stage"
+
+
+def _stage_plan_for_item(item: WorkloadItem, config: LiveGatewayConfig) -> dict[str, Any] | None:
+    """The row's staged-prefill plan when the run replays plans, else None."""
+    if not config.staged_prefill:
+        return None
+    plan = item.metadata.get("staged_prefill")
+    if not isinstance(plan, Mapping):
+        return None
+    token_ids, cuts = plan.get("token_ids"), plan.get("cuts")
+    if not token_ids or not cuts:
+        return None
+    if any(not 0 < int(cut) < len(token_ids) for cut in cuts):
+        return None
+    return {"token_ids": [int(t) for t in token_ids], "cuts": [int(c) for c in cuts]}
+
+
+def _send_stage(
+    *,
+    base_url: str,
+    model: str,
+    token_ids: Sequence[int],
+    tenant: str,
+    request_id: str | None,
+    timeout_seconds: float,
+) -> str | None:
+    """Prefill one prefix and keep it cached for the next stage. Error text or None."""
+    payload: dict[str, Any] = {
+        "model": model,
+        "prompt": list(token_ids),
+        "max_tokens": 1,
+        "temperature": 0,
+        "vllm_xargs": {STAGE_HINT_KEY: "1"},
+    }
+    headers = {"Content-Type": "application/json", "x-tenant-id": tenant}
+    if request_id:
+        payload["request_id"] = request_id
+        headers["X-Request-Id"] = request_id
+    req = Request(
+        f"{base_url}/v1/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urlopen(req, timeout=timeout_seconds) as resp:  # noqa: S310 - staging benchmark.
+            for _ in resp:  # drain; the one generated token is not used
+                pass
+    except HTTPError as exc:
+        return f"HTTP {exc.code}"
+    except URLError as exc:
+        return str(exc.reason)
+    return None
+
+
+def _staged_recipient_request(
+    *,
+    item: WorkloadItem,
+    config: LiveGatewayConfig,
+    base_url: str,
+    plan: Mapping[str, Any],
+    metrics_chunk: MetricsChunkCapture | None = None,
+) -> dict[str, Any]:
+    """Send the stages, then the full prompt; time the whole thing as one request.
+
+    The user waits from the first stage to the first token of the last
+    request, so that is the TTFT recorded; the last request's own TTFT is kept
+    beside it. The final request carries the row's token ids rather than its
+    chat messages so every stage is a byte-exact prefix of it.
+    """
+    token_ids = plan["token_ids"]
+    base_id = current_request_id()
+    started = time.perf_counter()
+    errors = []
+    for index, cut in enumerate(plan["cuts"]):
+        error = _send_stage(
+            base_url=base_url,
+            model=config.model,
+            token_ids=token_ids[:cut],
+            tenant=_tenant_for_item(item, config),
+            request_id=f"{base_id}-stage{index}" if base_id else None,
+            timeout_seconds=config.timeout_seconds,
+        )
+        if error is not None:
+            errors.append(error)
+    stage_ms = (time.perf_counter() - started) * 1000
+    hint = _capture_hint_for_item(item, config)
+    result = _chat_completion(
+        base_url=base_url,
+        model=config.model,
+        prompt=item.recipient_prompt,
+        max_tokens=config.recipient_max_tokens,
+        tenant=_tenant_for_item(item, config),
+        template=_template_for_item(item, config),
+        timeout_seconds=config.timeout_seconds,
+        prompt_token_ids=token_ids,
+        **({} if metrics_chunk is None else {"metrics_chunk": metrics_chunk}),
+        **({} if hint is None else {"extra_body": hint}),
+    )
+    final_ttft = result.get("ttft_ms")
+    result["staged_prefill"] = {
+        "stages": len(plan["cuts"]),
+        "stage_ms": stage_ms,
+        "final_ttft_ms": final_ttft,
+        "stage_errors": errors,
+    }
+    if final_ttft is not None:
+        result["ttft_ms"] = final_ttft + stage_ms
+    if "latency_ms" in result:
+        result["latency_ms"] = result["latency_ms"] + stage_ms
+    return result
+
+
 def _chat_completion(
     *,
     base_url: str,
@@ -665,6 +789,7 @@ def _chat_completion(
     metrics_chunk: MetricsChunkCapture | None = None,
     system: str | None = None,
     extra_body: Mapping[str, Any] | None = None,
+    prompt_token_ids: Sequence[int] | None = None,
 ) -> dict[str, Any]:
     # Set by the runner for the request being issued on this thread. Sent as a
     # header (which vLLM prefers) and as a body field (which survives a front
@@ -676,7 +801,13 @@ def _chat_completion(
     messages.append({"role": "user", "content": prompt})
     payload: dict[str, Any] = {
         "model": model,
-        "messages": messages,
+        # Token ids go to the completions endpoint verbatim; the chat endpoint
+        # would render the template itself and could tokenize differently.
+        **(
+            {"messages": messages}
+            if prompt_token_ids is None
+            else {"prompt": list(prompt_token_ids)}
+        ),
         "temperature": 0,
         "max_tokens": max_tokens,
         "stream": True,
@@ -695,8 +826,9 @@ def _chat_completion(
     if request_id:
         payload["request_id"] = request_id
         request_headers["X-Request-Id"] = request_id
+    endpoint = "chat/completions" if prompt_token_ids is None else "completions"
     req = Request(
-        f"{base_url}/v1/chat/completions",
+        f"{base_url}/v1/{endpoint}",
         data=json.dumps(payload).encode("utf-8"),
         headers=request_headers,
         method="POST",

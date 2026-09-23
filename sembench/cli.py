@@ -287,6 +287,7 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--template", default="rag-template-v1")
     # Oracle: the harness knows the roles, so this bounds capture_policy=hinted.
     gateway.add_argument("--capture-hint-role", default=None, help="hint capture on this role")
+    gateway.add_argument("--staged-prefill", action="store_true", help="replay row stage plans")
     gateway.add_argument("--block-size", type=int, default=16)
     gateway.add_argument("--tokenizer", default=None)
     gateway.add_argument("--max-items", type=int, default=None)
@@ -297,29 +298,26 @@ def build_parser() -> argparse.ArgumentParser:
     gateway.add_argument("--post-donor-delay-ms", type=int, default=0)
     gateway.add_argument(
         "--concurrency",
-        type=int, default=1,
-        help="Request streams in flight at once (default 1 = serial, unchanged). "
-        "Above 1 the run also writes a throughput document; TTFT stays per-request, "
-        "measured at the streamed first token",
+        type=int,
+        default=1,
+        help="Request streams in flight (default 1, serial). Above 1 a throughput document "
+        "is also written; TTFT stays per-request, at the streamed first token",
     )
     gateway.add_argument(
         "--min-donor-gap-requests",
-        type=int, default=0,
-        help="Minimum donor->recipient separation in COMPLETED requests, for manifests "
-        "that name their donor in metadata.donor_item_id. Under concurrency a gap "
-        "measured in stream positions does not hold",
+        type=int,
+        default=0,
+        help="Minimum donor->recipient separation in COMPLETED requests (manifests with "
+        "metadata.donor_item_id); under concurrency a stream-position gap does not hold",
     )
     gateway.add_argument(
         "--throughput-output",
         default=None,
         metavar="PATH",
-        help="Where to write the throughput document (default: <output> with a "
-        ".throughput.json suffix, written whenever --concurrency > 1)",
+        help="Throughput document path (default: <output>.throughput.json if --concurrency > 1)",
     )
     gateway.add_argument(
-        "--paired",
-        action="store_true",
-        help="Run a cold and a warm twin per item, adjacent in the stream (requires --reset-url)",
+        "--paired", action="store_true", help="Cold and warm twin per item (needs --reset-url)"
     )
     gateway.add_argument(
         "--reset-url",
@@ -547,6 +545,7 @@ def cmd_run_live_gateway(args) -> None:
         tenant=args.tenant,
         template=args.template,
         capture_hint_role=args.capture_hint_role,
+        staged_prefill=args.staged_prefill,
         block_size=args.block_size,
         tokenizer=args.tokenizer,
         max_items=args.max_items,
