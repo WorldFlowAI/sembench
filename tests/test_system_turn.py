@@ -113,7 +113,9 @@ def test_the_recipient_request_threads_the_system_turn(monkeypatch):
     monkeypatch.setattr(gateway_live, "_chat_completion", fake_chat_completion)
     config = _config()
 
-    gateway_live._recipient_request(item=_item(system_prompt=SYSTEM), config=config, base_url=GATEWAY)
+    gateway_live._recipient_request(
+        item=_item(system_prompt=SYSTEM), config=config, base_url=GATEWAY
+    )
 
     assert seen["system"] == SYSTEM
     assert seen["prompt"] == "the document"
@@ -149,8 +151,13 @@ def test_the_hint_is_only_built_for_the_configured_role():
     config = _config()
     assert gateway_live._capture_hint_for_item(_item(role="seed"), config) is None  # unset
     hinted = gateway_live.LiveGatewayConfig(
-        manifest=Path("m.jsonl"), output=Path("o.json"), gateway_url=GATEWAY, model="qwen",
-        recipient_max_tokens=8, donor_max_tokens=8, capture_hint_role="seed",
+        manifest=Path("m.jsonl"),
+        output=Path("o.json"),
+        gateway_url=GATEWAY,
+        model="qwen",
+        recipient_max_tokens=8,
+        donor_max_tokens=8,
+        capture_hint_role="seed",
     )
     assert gateway_live._capture_hint_for_item(_item(role="seed"), hinted) == {
         "vllm_xargs": {"semblend_capture": "1"}
@@ -168,8 +175,13 @@ def test_an_unhinted_row_makes_the_call_it_always_made(monkeypatch):
 
     monkeypatch.setattr(gateway_live, "_chat_completion", fake_chat_completion)
     hinted = gateway_live.LiveGatewayConfig(
-        manifest=Path("m.jsonl"), output=Path("o.json"), gateway_url=GATEWAY, model="qwen",
-        recipient_max_tokens=8, donor_max_tokens=8, capture_hint_role="seed",
+        manifest=Path("m.jsonl"),
+        output=Path("o.json"),
+        gateway_url=GATEWAY,
+        model="qwen",
+        recipient_max_tokens=8,
+        donor_max_tokens=8,
+        capture_hint_role="seed",
     )
     gateway_live._recipient_request(item=_item(role="recipient"), config=hinted, base_url=GATEWAY)
     assert "extra_body" not in seen

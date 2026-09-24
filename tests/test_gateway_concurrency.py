@@ -197,8 +197,12 @@ def test_throughput_document_counts_every_request_over_the_whole_arm(tmp_path, m
     assert doc["requests"] == 8  # four donors and four recipients
     assert doc["errors"] == 0
     assert doc["concurrency"] == 2
-    # wall_seconds is rounded in the document; the rate is not derived from it.
-    assert doc["requests_per_second"] == pytest.approx(8 / doc["wall_seconds"], rel=1e-2)
+    # wall_seconds is published rounded to 3 decimals while the rate uses the
+    # unrounded wall time, so reconstructing the rate from the rounded value
+    # carries up to 0.0005 s of error -- over 1% on a fast runner's ~0.04 s.
+    wall = doc["wall_seconds"]
+    rounding = 8 * 0.0005 / (wall * (wall - 0.0005))
+    assert doc["requests_per_second"] == pytest.approx(8 / wall, rel=1e-2, abs=rounding)
     assert doc["settle_seconds_est"] == 0.0
     assert doc["settle_excluded_basis"] == "measured_idle"
     assert doc["requests_per_second_excluding_settle"] >= doc["requests_per_second"]
